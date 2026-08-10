@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd"
+             schematypens="http://www.w3.org/2001/XMLSchema"?>
+
+<package format="3">
+  <name>rby1_navigation</name>
+  <version>0.0.0</version>
+  <description>SLAM Toolbox and Nav2 integration for RBY1</description>
+
+  <maintainer email="physrobotics4@example.com">
+    physrobotics4
+  </maintainer>
+
+  <license>Apache-2.0</license>
+
+  <!-- Python node dependencies -->
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav2_msgs</depend>
+
+  <!-- Launch dependencies -->
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+  <depend>ament_index_python</depend>
+
+  <!-- Navigation stack -->
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>navigation2</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_amcl</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+
+  <!-- Packages called by integrated launch files -->
+  <exec_depend>rby1_driver</exec_depend>
+  <exec_depend>rby1_bringup</exec_depend>
+  <exec_depend>rby1_control_ui</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

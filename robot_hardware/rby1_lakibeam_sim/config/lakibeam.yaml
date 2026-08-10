@@ -1,0 +1,55 @@
+mujoco_pose_bridge_node:
+  ros__parameters:
+    bind_address: 0.0.0.0
+    port: 15000
+    output_topic: /sim/ground_truth_pose
+    frame_id: sim_world
+    poll_frequency: 200.0
+    stale_timeout: 0.5
+    use_sim_time: false
+
+dual_lidar_node:
+  ros__parameters:
+    model_path: /root/sdk/rby1-sdk/models/rby1m/mujoco/lidar_shadow.xml
+
+    pose_topic: /sim/ground_truth_pose
+    pose_timeout: 0.5
+
+    front_topic: /scan_front_right
+    rear_topic: /scan_rear_left
+
+    front_frame: laser_front_right
+    rear_frame: laser_rear_left
+
+    front_site: lidar_front_site
+    rear_site: lidar_rear_site
+
+    scan_frequency: 30.0
+    range_min: 0.05
+    range_max: 20.0
+    fov_deg: 270.0
+    num_rays: 541
+
+    use_sim_time: false
+
+
+scan_merger_node:
+  ros__parameters:
+    scan0_topic: /scan_front_right
+    scan1_topic: /scan_rear_left
+
+    output_topic: /scan
+    target_frame: base_scan
+
+    output_angle_min: -3.141592653589793
+    output_angle_max: 3.141592653589793
+    output_angle_increment: 0.0
+
+    range_min: 0.05
+    range_max: 20.0
+
+    sync_slop: 0.02
+    sync_queue_size: 20
+    tf_timeout: 0.10
+
+    use_sim_time: false

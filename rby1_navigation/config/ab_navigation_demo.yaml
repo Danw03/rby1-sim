@@ -1,0 +1,21 @@
+ab_navigation_demo:
+  ros__parameters:
+    use_sim_time: false
+
+    action_name: /navigate_to_pose
+    frame_id: map
+
+    # [x, y, yaw(rad)]
+    p1: [0.0, 0.0, 0.0]
+    p2: [15.8, 5.0, 1.5708]
+
+    # 시뮬레이터가 P1에서 시작한다고 가정
+    first_goal: p2
+
+    start_delay: 3.0
+    wait_at_goal: 2.0
+    retry_delay: 3.0
+
+    # true: 무한 왕복
+    # false: P2 도착 후 P1으로 돌아오면 종료
+    repeat_forever: true

@@ -1,0 +1,18 @@
+/**:
+  ros__parameters:
+    # Relative names are resolved inside the node namespace, normally /rby1.
+    cmd_vel_topic: cmd_vel
+    robot_state_topic: robot_state
+    robot_power_service: robot_power
+    robot_servo_service: robot_servo
+    stream_control_service: stream_control
+
+    # Set false to use this as a generic cmd_vel-only UI on another robot.
+    use_rby1_services: true
+
+    # The original mobile-base example publishes about 25 Hz.
+    publish_rate_hz: 25.0
+
+    # Safety watchdog: stale non-zero commands are replaced with zero Twist.
+    command_timeout_sec: 0.35
+    publish_zero_when_idle: true
