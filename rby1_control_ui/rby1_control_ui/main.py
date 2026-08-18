@@ -1,24 +1,57 @@
-"""Application entry point."""
-
+"""Application entry point for RB-Y1 Control UI."""
 from __future__ import annotations
 
+import os
 import signal
 import sys
 import time
 
-import rclpy
-
 from .qt_compat import QApplication, QTimer, QT_BINDING, app_exec
-from .ros_backend import Rby1ControlNode
 from .main_window import MainWindow
 
 
-def main(args=None) -> None:
-    rclpy.init(args=args)
-    app = QApplication(sys.argv)
-    app.setApplicationName('RB-Y1 Universal Control UI')
+def _select_mode():
+    argv = [arg for arg in sys.argv if arg != '--mock']
+    use_mock = '--mock' in sys.argv
+    if os.environ.get('RBY1_UI_BACKEND', '').strip().lower() == 'mock':
+        use_mock = True
+    return ('mock' if use_mock else 'ros'), argv
+
+
+def _run_mock(argv):
+    from .mock_backend import MockRby1Backend
+
+    app = QApplication(argv)
+    app.setApplicationName('RB-Y1 M v1.3 Control UI')
+    backend = MockRby1Backend()
+    window = MainWindow(backend)
+    app.installEventFilter(window)
+
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    signal_timer = QTimer()
+    signal_timer.setInterval(250)
+    signal_timer.timeout.connect(lambda: None)
+    signal_timer.start()
+
+    window.append_log('info', f'Qt binding: {QT_BINDING}')
+    window.show()
+    try:
+        return app_exec(app)
+    finally:
+        signal_timer.stop()
+        backend.shutdown_safely(turn_stream_off=True)
+
+
+def _run_ros(argv):
+    import rclpy
+    from .ros_backend import Rby1ControlNode
+
+    rclpy.init(args=argv[1:])
+    app = QApplication(argv)
+    app.setApplicationName('RB-Y1 M v1.3 Control UI')
 
     node = Rby1ControlNode()
+    node.backend_name = 'ROS2'
     window = MainWindow(node)
     app.installEventFilter(window)
 
@@ -43,16 +76,20 @@ def main(args=None) -> None:
         spin_timer.stop()
         signal_timer.stop()
         node.shutdown_safely(turn_stream_off=True)
-
         deadline = time.monotonic() + 1.0
         while rclpy.ok() and time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=0.05)
-
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+    return exit_code
 
-    raise SystemExit(exit_code)
+
+def main(args=None) -> None:
+    del args
+    mode, argv = _select_mode()
+    code = _run_mock(argv) if mode == 'mock' else _run_ros(argv)
+    raise SystemExit(code)
 
 
 if __name__ == '__main__':

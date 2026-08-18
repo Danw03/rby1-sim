@@ -1,8 +1,16 @@
 """ROS 2 backend for the RB-Y1 control UI.
 
 The backend keeps the Qt GUI independent from ROS message handling.
-It publishes geometry_msgs/Twist continuously and optionally uses RB-Y1
-power, servo, stream-control services, and robot-state feedback.
+
+Supported paths:
+- mobile base velocity through geometry_msgs/Twist
+- power / servo / stream control through StateOnOff services
+- robot state monitoring
+- joint state monitoring
+- joint position commands through Rby1JointCommand
+- Cartesian pose monitoring through GetCartesianPose
+- Cartesian position commands through Rby1CartesianCommand
+- motion cancellation through cancel_control
 """
 
 from __future__ import annotations
@@ -15,18 +23,71 @@ import time
 from typing import Deque, Dict, List, Optional, Tuple
 
 from geometry_msgs.msg import Twist
+from rclpy.action import ActionClient
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from std_srvs.srv import Trigger
 
 try:
-    from rby1_msgs.msg import RobotState
-    from rby1_msgs.srv import StateOnOff
+    from rby1_msgs.action import (
+        Rby1CartesianCommand,
+        Rby1JointCommand,
+    )
+    from rby1_msgs.msg import (
+        CartesianCommand,
+        JointCommand,
+        RobotState,
+    )
+    from rby1_msgs.srv import (
+        GetCartesianPose,
+        StateOnOff,
+    )
 
     RBY1_MSGS_AVAILABLE = True
 except ImportError:
+    Rby1CartesianCommand = None  # type: ignore[assignment]
+    Rby1JointCommand = None  # type: ignore[assignment]
+    CartesianCommand = None  # type: ignore[assignment]
+    JointCommand = None  # type: ignore[assignment]
     RobotState = None  # type: ignore[assignment]
+    GetCartesianPose = None  # type: ignore[assignment]
     StateOnOff = None  # type: ignore[assignment]
     RBY1_MSGS_AVAILABLE = False
 
+# RB-Y1 M v1.3 joint position limits from model_v1_3.urdf.
+# Unit: rad
+JOINT_LIMITS_RAD = {
+    "torso": (
+        (-0.261799388, 0.261799388),
+        (-0.523598776, 1.570796327),
+        (-2.617993878, 1.570796327),
+        (-0.785398163, 1.570796327),
+        (-0.523598776, 0.523598776),
+        (-2.35619449, 2.35619449),
+    ),
+    "right_arm": (
+        (-3.141592654, 3.141592654),
+        (-3.141592654, 0.017453293),
+        (-3.141592654, 3.141592654),
+        (-2.617993878, 0.017453293),
+        (-3.141592654, 3.141592654),
+        (-0.8726646260, 0.8726646260),
+        (-1.5707963268, 1.5707963268),
+    ),
+    "left_arm": (
+        (-3.141592654, 3.141592654),
+        (-0.017453293, 3.141592654),
+        (-3.141592654, 3.141592654),
+        (-2.617993878, 0.017453293),
+        (-3.141592654, 3.141592654),
+        (-0.8726646260, 0.8726646260),
+        (-1.5707963268, 1.5707963268),
+    ),
+    "head": (
+        (-1.57, 1.57),
+        (-1.57, 1.57),
+    ),
+}
 
 @dataclass(frozen=True)
 class VelocityCommand:
@@ -66,7 +127,7 @@ class Rby1ControlNode(Node):
     """ROS node used by the Qt interface."""
 
     def __init__(self) -> None:
-        super().__init__('rby1_control_ui')
+        super().__init__('rby1_control_ui', namespace='rby1')
 
         # ROS topic and service names.
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
@@ -78,11 +139,73 @@ class Rby1ControlNode(Node):
             'stream_control',
         )
 
+        # Manipulation interfaces exposed by rby1_driver.
+        self.declare_parameter('joint_action', 'robot_joint')
+        self.declare_parameter(
+            'cartesian_action',
+            'robot_cartesian',
+        )
+        self.declare_parameter(
+            'cartesian_pose_service',
+            'get_cartesian_pose',
+        )
+        self.declare_parameter(
+            'cancel_control_service',
+            'cancel_control',
+        )
+
+        self.declare_parameter(
+            'right_arm_joint_state_topic',
+            'joint_states/right_arm',
+        )
+        self.declare_parameter(
+            'left_arm_joint_state_topic',
+            'joint_states/left_arm',
+        )
+        self.declare_parameter(
+            'torso_joint_state_topic',
+            'joint_states/torso',
+        )
+        self.declare_parameter(
+            'head_joint_state_topic',
+            'joint_states/head',
+        )
+
+        # Current RB-Y1 M v1.3 Cartesian operator frame.
+        self.declare_parameter(
+            'right_cartesian_ref_link',
+            'base',
+        )
+        self.declare_parameter(
+            'right_cartesian_target_link',
+            'ee_right',
+        )
+        self.declare_parameter(
+            'left_cartesian_ref_link',
+            'base',
+        )
+        self.declare_parameter(
+            'left_cartesian_target_link',
+            'ee_left',
+        )
+
         # Backend behavior.
         self.declare_parameter('use_rby1_services', True)
         self.declare_parameter('publish_rate_hz', 25.0)
         self.declare_parameter('command_timeout_sec', 0.35)
         self.declare_parameter('publish_zero_when_idle', True)
+        self.declare_parameter(
+            'cartesian_state_period_sec',
+            0.25,
+        )
+        self.declare_parameter(
+            'joint_jog_minimum_time_sec',
+            1.0,
+        )
+        self.declare_parameter(
+            'cartesian_jog_minimum_time_sec',
+            1.0,
+        )
 
         self.cmd_vel_topic = str(
             self.get_parameter('cmd_vel_topic').value
@@ -99,6 +222,69 @@ class Rby1ControlNode(Node):
         self.stream_control_service = str(
             self.get_parameter('stream_control_service').value
         )
+
+        self.joint_action_name = str(
+            self.get_parameter('joint_action').value
+        )
+        self.cartesian_action_name = str(
+            self.get_parameter('cartesian_action').value
+        )
+        self.cartesian_pose_service = str(
+            self.get_parameter('cartesian_pose_service').value
+        )
+        self.cancel_control_service = str(
+            self.get_parameter('cancel_control_service').value
+        )
+
+        self.joint_state_topics = {
+            'right_arm': str(
+                self.get_parameter(
+                    'right_arm_joint_state_topic'
+                ).value
+            ),
+            'left_arm': str(
+                self.get_parameter(
+                    'left_arm_joint_state_topic'
+                ).value
+            ),
+            'torso': str(
+                self.get_parameter(
+                    'torso_joint_state_topic'
+                ).value
+            ),
+            'head': str(
+                self.get_parameter(
+                    'head_joint_state_topic'
+                ).value
+            ),
+        }
+
+        self.cartesian_links = {
+            'right_arm': (
+                str(
+                    self.get_parameter(
+                        'right_cartesian_ref_link'
+                    ).value
+                ),
+                str(
+                    self.get_parameter(
+                        'right_cartesian_target_link'
+                    ).value
+                ),
+            ),
+            'left_arm': (
+                str(
+                    self.get_parameter(
+                        'left_cartesian_ref_link'
+                    ).value
+                ),
+                str(
+                    self.get_parameter(
+                        'left_cartesian_target_link'
+                    ).value
+                ),
+            ),
+        }
 
         requested_services = bool(
             self.get_parameter('use_rby1_services').value
@@ -122,6 +308,27 @@ class Rby1ControlNode(Node):
             self.get_parameter('publish_zero_when_idle').value
         )
 
+        self.cartesian_state_period_sec = self._positive_float(
+            self.get_parameter(
+                'cartesian_state_period_sec'
+            ).value,
+            fallback=0.25,
+        )
+
+        self.joint_jog_minimum_time_sec = self._positive_float(
+            self.get_parameter(
+                'joint_jog_minimum_time_sec'
+            ).value,
+            fallback=1.0,
+        )
+
+        self.cartesian_jog_minimum_time_sec = self._positive_float(
+            self.get_parameter(
+                'cartesian_jog_minimum_time_sec'
+            ).value,
+            fallback=1.0,
+        )
+
         # Shared command state.
         self._lock = threading.RLock()
 
@@ -140,6 +347,35 @@ class Rby1ControlNode(Node):
         self.collision_active: Optional[bool] = None
 
         self._robot_state_received = False
+
+        # Manipulator state returned to the Qt GUI.
+        self._joint_groups_deg: Dict[
+            str,
+            Optional[List[float]],
+        ] = {
+            'right_arm': None,
+            'left_arm': None,
+            'torso': None,
+            'head': None,
+        }
+
+        self._cartesian_state: Dict[
+            str,
+            Optional[List[float]],
+        ] = {
+            'right_arm': None,
+            'left_arm': None,
+        }
+
+        self._cartesian_request_pending = {
+            'right_arm': False,
+            'left_arm': False,
+        }
+
+        # Keep one manipulation command active at a time.
+        self._motion_busy = False
+        self._active_motion_kind: Optional[str] = None
+        self._active_goal_handle = None
 
         # Prepare Robot state machine.
         self._prepare_stage = 'idle'
@@ -162,9 +398,18 @@ class Rby1ControlNode(Node):
         self.stream_client = None
         self.state_sub = None
 
+        self.joint_action_client = None
+        self.cartesian_action_client = None
+        self.cartesian_pose_client = None
+        self.cancel_control_client = None
+        self.joint_state_subs = []
+
         if self.services_enabled:
             assert StateOnOff is not None
             assert RobotState is not None
+            assert GetCartesianPose is not None
+            assert Rby1JointCommand is not None
+            assert Rby1CartesianCommand is not None
 
             self.power_client = self.create_client(
                 StateOnOff,
@@ -188,6 +433,41 @@ class Rby1ControlNode(Node):
                 10,
             )
 
+            self.cartesian_pose_client = self.create_client(
+                GetCartesianPose,
+                self.cartesian_pose_service,
+            )
+
+            self.cancel_control_client = self.create_client(
+                Trigger,
+                self.cancel_control_service,
+            )
+
+            self.joint_action_client = ActionClient(
+                self,
+                Rby1JointCommand,
+                self.joint_action_name,
+            )
+
+            self.cartesian_action_client = ActionClient(
+                self,
+                Rby1CartesianCommand,
+                self.cartesian_action_name,
+            )
+
+            for group, topic in self.joint_state_topics.items():
+                subscription = self.create_subscription(
+                    JointState,
+                    topic,
+                    lambda msg, group_name=group:
+                    self._joint_state_callback(
+                        group_name,
+                        msg,
+                    ),
+                    10,
+                )
+                self.joint_state_subs.append(subscription)
+
         elif requested_services:
             self._push_event(
                 'warning',
@@ -205,6 +485,12 @@ class Rby1ControlNode(Node):
         self.operation_timer = self.create_timer(
             0.05,
             self._process_prepare_operation,
+        )
+
+        # Poll Cartesian pose asynchronously.  Joint state arrives by topic.
+        self.cartesian_state_timer = self.create_timer(
+            self.cartesian_state_period_sec,
+            self._poll_cartesian_state,
         )
 
         self._push_event(
@@ -296,6 +582,7 @@ class Rby1ControlNode(Node):
 
             if new_emo_active:
                 self.stop(publish_immediately=True)
+                self.cancel_motion()
 
         if new_collision_active != self.collision_active:
             self.collision_active = new_collision_active
@@ -308,6 +595,773 @@ class Rby1ControlNode(Node):
 
             if new_collision_active:
                 self.stop(publish_immediately=True)
+                self.cancel_motion()
+
+    def _joint_state_callback(
+        self,
+        group: str,
+        msg: JointState,
+    ) -> None:
+        """Cache a joint group state in operator-friendly degrees."""
+
+        expected_names = {
+            'right_arm': [
+                f'right_arm_{index}'
+                for index in range(7)
+            ],
+            'left_arm': [
+                f'left_arm_{index}'
+                for index in range(7)
+            ],
+            'torso': [
+                f'torso_{index}'
+                for index in range(6)
+            ],
+            'head': [
+                f'head_{index}'
+                for index in range(2)
+            ],
+        }
+
+        names = expected_names.get(group)
+        if names is None:
+            return
+
+        position_by_name = {
+            str(name): float(position)
+            for name, position in zip(
+                msg.name,
+                msg.position,
+            )
+        }
+
+        try:
+            ordered_rad = [
+                position_by_name[name]
+                for name in names
+            ]
+        except KeyError:
+            # Fall back to message ordering only if the expected names
+            # are unavailable.
+            if len(msg.position) < len(names):
+                return
+            ordered_rad = [
+                float(value)
+                for value in msg.position[:len(names)]
+            ]
+
+        ordered_deg = [
+            math.degrees(value)
+            for value in ordered_rad
+        ]
+
+        with self._lock:
+            self._joint_groups_deg[group] = ordered_deg
+
+    def _poll_cartesian_state(self) -> None:
+        """Request current right/left end-effector poses asynchronously."""
+
+        if (
+            not self.services_enabled
+            or self.cartesian_pose_client is None
+            or GetCartesianPose is None
+        ):
+            return
+
+        if not self.cartesian_pose_client.service_is_ready():
+            return
+
+        for arm in ('right_arm', 'left_arm'):
+            if self._cartesian_request_pending[arm]:
+                continue
+
+            ref_link, target_link = self.cartesian_links[arm]
+
+            request = GetCartesianPose.Request()
+            request.ref_link = ref_link
+            request.target_link = target_link
+
+            future = self.cartesian_pose_client.call_async(
+                request
+            )
+
+            self._cartesian_request_pending[arm] = True
+            self._pending_futures.append(future)
+
+            future.add_done_callback(
+                lambda done, arm_name=arm:
+                self._cartesian_pose_done(
+                    done,
+                    arm_name,
+                )
+            )
+
+    def _cartesian_pose_done(
+        self,
+        future,
+        arm: str,
+    ) -> None:
+        self._discard_future(future)
+        self._cartesian_request_pending[arm] = False
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            self._push_event(
+                'warning',
+                f'Cartesian pose request failed '
+                f'for {arm}: {exc}',
+            )
+            return
+
+        if response is None:
+            return
+
+        transform = response.transform
+
+        roll_deg, pitch_deg, yaw_deg = (
+            self._quaternion_to_rpy_deg(
+                float(transform.rotation.x),
+                float(transform.rotation.y),
+                float(transform.rotation.z),
+                float(transform.rotation.w),
+            )
+        )
+
+        pose = [
+            float(transform.translation.x),
+            float(transform.translation.y),
+            float(transform.translation.z),
+            roll_deg,
+            pitch_deg,
+            yaw_deg,
+        ]
+
+        with self._lock:
+            self._cartesian_state[arm] = pose
+
+    @staticmethod
+    def _quaternion_to_rpy_deg(
+        x: float,
+        y: float,
+        z: float,
+        w: float,
+    ) -> Tuple[float, float, float]:
+        """Quaternion -> roll/pitch/yaw in degrees."""
+
+        sinr_cosp = 2.0 * (w * x + y * z)
+        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+        roll = math.atan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (w * y - z * x)
+        sinp = max(-1.0, min(1.0, sinp))
+        pitch = math.asin(sinp)
+
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        return (
+            math.degrees(roll),
+            math.degrees(pitch),
+            math.degrees(yaw),
+        )
+
+    @staticmethod
+    def _rpy_deg_to_quaternion(
+        roll_deg: float,
+        pitch_deg: float,
+        yaw_deg: float,
+    ) -> Tuple[float, float, float, float]:
+        """Roll/pitch/yaw in degrees -> quaternion x/y/z/w."""
+
+        roll = math.radians(roll_deg)
+        pitch = math.radians(pitch_deg)
+        yaw = math.radians(yaw_deg)
+
+        cr = math.cos(roll * 0.5)
+        sr = math.sin(roll * 0.5)
+        cp = math.cos(pitch * 0.5)
+        sp = math.sin(pitch * 0.5)
+        cy = math.cos(yaw * 0.5)
+        sy = math.sin(yaw * 0.5)
+
+        w = cr * cp * cy + sr * sp * sy
+        x = sr * cp * cy - cr * sp * sy
+        y = cr * sp * cy + sr * cp * sy
+        z = cr * cp * sy - sr * sp * cy
+
+        return x, y, z, w
+
+    def get_motion_state(self) -> Dict[str, object]:
+        """Return cached joint and Cartesian state for the Qt GUI."""
+
+        with self._lock:
+            joint_groups = {
+                group: (
+                    list(values)
+                    if values is not None
+                    else None
+                )
+                for group, values
+                in self._joint_groups_deg.items()
+            }
+
+            cartesian = {
+                arm: (
+                    list(values)
+                    if values is not None
+                    else None
+                )
+                for arm, values
+                in self._cartesian_state.items()
+            }
+
+        return {
+            'joint_groups': joint_groups,
+            'cartesian': cartesian,
+        }
+
+    def _motion_command_allowed(self) -> bool:
+        """Common safety gate before sending a manipulation goal."""
+
+        if not self.services_enabled:
+            self._push_event(
+                'warning',
+                'RB-Y1 manipulation interfaces are disabled.',
+            )
+            return False
+
+        if self.emo_active is True:
+            self._push_event(
+                'error',
+                'Motion rejected: EMO is active.',
+            )
+            return False
+
+        if self.collision_active is True:
+            self._push_event(
+                'error',
+                'Motion rejected: collision state is active.',
+            )
+            return False
+
+        if self.control_state not in (2, 3):
+            self._push_event(
+                'warning',
+                'Motion rejected: robot control state '
+                'is not ENABLE/EXECUTING.',
+            )
+            return False
+
+        if self._motion_busy:
+            self._push_event(
+                'warning',
+                'Motion rejected: another Joint/Cartesian '
+                'command is still active.',
+            )
+            return False
+
+        return True
+
+    def jog_joint(
+        self,
+        group: str,
+        index: int,
+        delta_deg: float,
+    ) -> None:
+        """Jog one joint by sending a full-group absolute target."""
+
+        with self._lock:
+            current = self._joint_groups_deg.get(group)
+            current_copy = (
+                list(current)
+                if current is not None
+                else None
+            )
+
+        if current_copy is None:
+            self._push_event(
+                'warning',
+                f'Joint jog rejected: no state for {group}.',
+            )
+            return
+
+        if index < 0 or index >= len(current_copy):
+            self._push_event(
+                'error',
+                f'Joint jog rejected: invalid index {index}.',
+            )
+            return
+
+        current_copy[index] += float(delta_deg)
+
+        self.move_joint_group(
+            group,
+            current_copy,
+            self.joint_jog_minimum_time_sec,
+        )
+    def _validate_joint_targets(
+    self,
+    group: str,
+    targets_deg: List[float],
+) -> bool:
+        """Check requested joint targets against RB-Y1 M v1.3 limits."""
+
+        limits = JOINT_LIMITS_RAD.get(group)
+
+        if limits is None:
+            self._push_event(
+                "error",
+                f"No joint limits defined for group: {group}.",
+            )
+            return False
+
+        if len(targets_deg) != len(limits):
+            self._push_event(
+                "error",
+                f"{group} target count does not match joint limits.",
+            )
+            return False
+
+        for index, (target_deg, limit) in enumerate(
+            zip(targets_deg, limits)
+        ):
+            lower_rad, upper_rad = limit
+            target_rad = math.radians(float(target_deg))
+
+            if (
+                target_rad < lower_rad
+                or target_rad > upper_rad
+            ):
+                lower_deg = math.degrees(lower_rad)
+                upper_deg = math.degrees(upper_rad)
+
+                joint_name = f"{group}_{index}"
+
+                self._push_event(
+                    "warning",
+                    "Motion rejected: "
+                    f"{joint_name} target "
+                    f"{target_deg:+.2f} deg is outside "
+                    f"[{lower_deg:+.2f}, "
+                    f"{upper_deg:+.2f}] deg.",
+                )
+
+                return False
+
+        return True
+    
+    def move_joint_group(
+        self,
+        group: str,
+        targets_deg: List[float],
+        minimum_time: float,
+    ) -> None:
+        """Send an absolute joint-position command.
+
+        GUI values are degrees.  The ROS action receives radians.
+        """
+
+        expected_dof = {
+            'right_arm': 7,
+            'left_arm': 7,
+            'torso': 6,
+            'head': 2,
+        }
+
+        dof = expected_dof.get(group)
+        if dof is None:
+            self._push_event(
+                'error',
+                f'Unknown joint group: {group}.',
+            )
+            return
+
+        if len(targets_deg) != dof:
+            self._push_event(
+                'error',
+                f'{group} expects {dof} targets, '
+                f'got {len(targets_deg)}.',
+            )
+            return
+
+        values_deg = [
+            float(value)
+            for value in targets_deg
+        ]
+
+        if not all(math.isfinite(v) for v in values_deg):
+            self._push_event(
+                'error',
+                'Non-finite joint target rejected.',
+            )
+            return
+
+        if not self._validate_joint_targets(
+            group,
+            values_deg,
+        ):
+            return
+
+        if not self._motion_command_allowed():
+            return
+
+        if (
+            self.joint_action_client is None
+            or Rby1JointCommand is None
+            or JointCommand is None
+        ):
+            self._push_event(
+                'error',
+                'Joint action client is unavailable.',
+            )
+            return
+
+        if not self.joint_action_client.server_is_ready():
+            self._push_event(
+                'warning',
+                f'Joint action server not ready: '
+                f'{self.joint_action_name}',
+            )
+            return
+
+        command = JointCommand()
+        command.position = [
+            math.radians(value)
+            for value in values_deg
+        ]
+        command.minimum_time = max(
+            0.1,
+            float(minimum_time),
+        )
+
+        goal = Rby1JointCommand.Goal()
+        setattr(goal, group, command)
+
+        self._send_motion_goal(
+            client=self.joint_action_client,
+            goal=goal,
+            label=f'Joint {group}',
+        )
+
+    def jog_cartesian(
+        self,
+        arm: str,
+        axis_index: int,
+        delta: float,
+        reference_frame: str = 'base',
+    ) -> None:
+        """Jog one Cartesian component from the latest absolute pose."""
+
+        del reference_frame
+
+        with self._lock:
+            current = self._cartesian_state.get(arm)
+            target = (
+                list(current)
+                if current is not None
+                else None
+            )
+
+        if target is None:
+            self._push_event(
+                'warning',
+                f'Cartesian jog rejected: '
+                f'no current pose for {arm}.',
+            )
+            return
+
+        if axis_index < 0 or axis_index >= 6:
+            self._push_event(
+                'error',
+                f'Cartesian jog rejected: '
+                f'invalid axis {axis_index}.',
+            )
+            return
+
+        target[axis_index] += float(delta)
+
+        self.move_cartesian(
+            arm,
+            target,
+            self.cartesian_jog_minimum_time_sec,
+            reference_frame='base',
+        )
+
+    def move_cartesian(
+        self,
+        arm: str,
+        target: List[float],
+        minimum_time: float,
+        reference_frame: str = 'base',
+    ) -> None:
+        """Send an absolute Cartesian target.
+
+        target = [x, y, z, roll_deg, pitch_deg, yaw_deg]
+        """
+
+        if arm not in ('right_arm', 'left_arm'):
+            self._push_event(
+                'error',
+                f'Unknown Cartesian arm: {arm}.',
+            )
+            return
+
+        if len(target) != 6:
+            self._push_event(
+                'error',
+                'Cartesian target must contain 6 values.',
+            )
+            return
+
+        values = [float(value) for value in target]
+
+        if not all(math.isfinite(v) for v in values):
+            self._push_event(
+                'error',
+                'Non-finite Cartesian target rejected.',
+            )
+            return
+
+        if not self._motion_command_allowed():
+            return
+
+        if (
+            self.cartesian_action_client is None
+            or Rby1CartesianCommand is None
+            or CartesianCommand is None
+        ):
+            self._push_event(
+                'error',
+                'Cartesian action client is unavailable.',
+            )
+            return
+
+        if not self.cartesian_action_client.server_is_ready():
+            self._push_event(
+                'warning',
+                f'Cartesian action server not ready: '
+                f'{self.cartesian_action_name}',
+            )
+            return
+
+        configured_ref, target_link = self.cartesian_links[arm]
+
+        # The current UI exposes Base as the operator reference frame.
+        # Keep the verified configured link unless a future UI explicitly
+        # introduces a selectable frame.
+        ref_link = (
+            configured_ref
+            if reference_frame == 'base'
+            else str(reference_frame)
+        )
+
+        command = CartesianCommand()
+        command.ref_link = ref_link
+        command.target_link = target_link
+
+        command.transform.translation.x = values[0]
+        command.transform.translation.y = values[1]
+        command.transform.translation.z = values[2]
+
+        qx, qy, qz, qw = self._rpy_deg_to_quaternion(
+            values[3],
+            values[4],
+            values[5],
+        )
+
+        command.transform.rotation.x = qx
+        command.transform.rotation.y = qy
+        command.transform.rotation.z = qz
+        command.transform.rotation.w = qw
+
+        command.minimum_time = max(
+            0.1,
+            float(minimum_time),
+        )
+
+        goal = Rby1CartesianCommand.Goal()
+        setattr(goal, arm, command)
+
+        self._send_motion_goal(
+            client=self.cartesian_action_client,
+            goal=goal,
+            label=f'Cartesian {arm}',
+        )
+
+    def _send_motion_goal(
+        self,
+        client,
+        goal,
+        label: str,
+    ) -> None:
+        self._motion_busy = True
+        self._active_motion_kind = label
+
+        future = client.send_goal_async(goal)
+        self._pending_futures.append(future)
+
+        future.add_done_callback(
+            lambda done, motion_label=label:
+            self._motion_goal_response(
+                done,
+                motion_label,
+            )
+        )
+
+        self._push_event(
+            'info',
+            f'{label} goal requested.',
+        )
+
+    def _motion_goal_response(
+        self,
+        future,
+        label: str,
+    ) -> None:
+        self._discard_future(future)
+
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self._motion_busy = False
+            self._active_motion_kind = None
+            self._active_goal_handle = None
+
+            self._push_event(
+                'error',
+                f'{label} goal request failed: {exc}',
+            )
+            return
+
+        if goal_handle is None or not goal_handle.accepted:
+            self._motion_busy = False
+            self._active_motion_kind = None
+            self._active_goal_handle = None
+
+            self._push_event(
+                'error',
+                f'{label} goal was rejected.',
+            )
+            return
+
+        self._active_goal_handle = goal_handle
+
+        self._push_event(
+            'info',
+            f'{label} goal accepted.',
+        )
+
+        result_future = goal_handle.get_result_async()
+        self._pending_futures.append(result_future)
+
+        result_future.add_done_callback(
+            lambda done, motion_label=label:
+            self._motion_result_done(
+                done,
+                motion_label,
+            )
+        )
+
+    def _motion_result_done(
+        self,
+        future,
+        label: str,
+    ) -> None:
+        self._discard_future(future)
+
+        self._motion_busy = False
+        self._active_motion_kind = None
+        self._active_goal_handle = None
+
+        try:
+            wrapped_result = future.result()
+            result = wrapped_result.result
+        except Exception as exc:
+            self._push_event(
+                'error',
+                f'{label} result failed: {exc}',
+            )
+            return
+
+        if bool(result.success):
+            self._push_event(
+                'info',
+                f'{label} completed: '
+                f'{result.finish_code}',
+            )
+        else:
+            self._push_event(
+                'warning',
+                f'{label} finished unsuccessfully: '
+                f'{result.finish_code}',
+            )
+
+    def cancel_motion(self) -> None:
+        """Cancel robot control through the driver's Trigger service.
+
+        The driver's cancel_control service is intentionally used here as
+        the safety-oriented common cancel path for Joint/Cartesian control.
+        """
+
+        if self.cancel_control_client is None:
+            return
+
+        if not self.cancel_control_client.service_is_ready():
+            self._push_event(
+                'warning',
+                f'Cancel service not ready: '
+                f'{self.cancel_control_service}',
+            )
+            return
+
+        request = Trigger.Request()
+        future = self.cancel_control_client.call_async(request)
+
+        self._pending_futures.append(future)
+
+        future.add_done_callback(
+            self._cancel_motion_done
+        )
+
+        self._push_event(
+            'warning',
+            'Motion cancel requested.',
+        )
+
+    def _cancel_motion_done(self, future) -> None:
+        self._discard_future(future)
+
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._push_event(
+                'error',
+                f'Motion cancel failed: {exc}',
+            )
+            return
+
+        if result is not None and bool(result.success):
+            self._motion_busy = False
+            self._active_motion_kind = None
+            self._active_goal_handle = None
+
+            self._push_event(
+                'info',
+                f'Motion cancel succeeded: '
+                f'{result.message}',
+            )
+        else:
+            message = (
+                getattr(result, 'message', 'No response')
+                if result is not None
+                else 'No response'
+            )
+            self._push_event(
+                'error',
+                f'Motion cancel failed: {message}',
+            )
 
     def set_velocity(
         self,
@@ -817,6 +1871,22 @@ class Rby1ControlNode(Node):
                 self.stream_client
                 and self.stream_client.service_is_ready()
             ),
+            'cartesian_pose': bool(
+                self.cartesian_pose_client
+                and self.cartesian_pose_client.service_is_ready()
+            ),
+            'cancel_control': bool(
+                self.cancel_control_client
+                and self.cancel_control_client.service_is_ready()
+            ),
+            'joint_action': bool(
+                self.joint_action_client
+                and self.joint_action_client.server_is_ready()
+            ),
+            'cartesian_action': bool(
+                self.cartesian_action_client
+                and self.cartesian_action_client.server_is_ready()
+            ),
         }
 
         return BackendSnapshot(
@@ -849,6 +1919,7 @@ class Rby1ControlNode(Node):
         """Stop motion and optionally request Stream OFF."""
 
         self.stop(publish_immediately=True)
+        self.cancel_motion()
 
         for _ in range(4):
             self._publish_twist(
