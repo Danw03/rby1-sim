@@ -6,7 +6,7 @@ Always visible:
 - Power / Servo / Stream controls
 - Control Manager command area
 - compact robot / safety state
-- E-Stop command area (UI only until backend connection is verified)
+- hardware EMO / E-Stop status area (no software E-Stop command)
 
 Each tab provides a software MOTION STOP.
 Space triggers the same MOTION STOP action.
@@ -227,7 +227,6 @@ class MainWindow(QMainWindow):
 
         # --------------------------------------------------------------
         # Control Manager
-        # UI skeleton first. Commands will be connected in the next step.
         # --------------------------------------------------------------
         control_manager_group = QGroupBox("Control Manager")
         control_manager_layout = QGridLayout(control_manager_group)
@@ -238,15 +237,24 @@ class MainWindow(QMainWindow):
         self.control_manager_disable_button = QPushButton("DISABLE")
         self.control_manager_reset_button = QPushButton("RESET")
 
+        self.control_manager_enable_button.clicked.connect(
+            lambda: self.backend.request_control_manager("enable")
+        )
+        self.control_manager_disable_button.clicked.connect(
+            lambda: self.backend.request_control_manager("disable")
+        )
+        self.control_manager_reset_button.clicked.connect(
+            lambda: self.backend.request_control_manager("reset")
+        )
+
+        # refresh_backend_status() enables these only when the ROS service
+        # is actually available.
         for button in (
             self.control_manager_enable_button,
             self.control_manager_disable_button,
             self.control_manager_reset_button,
         ):
             button.setEnabled(False)
-            button.setToolTip(
-                "Control Manager command will be connected next."
-            )
 
         control_manager_layout.addWidget(
             self.control_manager_enable_button, 0, 0
@@ -311,16 +319,21 @@ class MainWindow(QMainWindow):
         state_layout.setColumnStretch(4, 1)
 
         # --------------------------------------------------------------
-        # E-Stop
-        # Layout only for now. Do not connect this to MOTION STOP.
+        # Hardware EMO / E-Stop status
+        #
+        # The public rby1-ros2 / rby1-sdk interfaces expose EMO state
+        # feedback, but no supported software E-Stop command.  Keep this
+        # control non-clickable so it cannot be confused with MOTION STOP.
         # --------------------------------------------------------------
-        self.estop_button = QPushButton("ESTOP")
+        self.estop_button = QPushButton("E-STOP\nHW ONLY")
         self.estop_button.setObjectName("eStopButton")
         self.estop_button.setMinimumWidth(95)
         self.estop_button.setMinimumHeight(74)
         self.estop_button.setEnabled(False)
+        self.estop_button.setProperty("emoActive", False)
         self.estop_button.setToolTip(
-            "E-Stop command is not connected yet."
+            "Hardware EMO status only. Use the physical EMO remote for "
+            "emergency stop."
         )
 
         layout.addWidget(power_group)
@@ -357,6 +370,37 @@ class MainWindow(QMainWindow):
         # Re-polish so object-name based style updates immediately.
         label.style().unpolish(label)
         label.style().polish(label)
+
+    def _set_estop_status(self, emo_active) -> None:
+        """Mirror physical EMO feedback without exposing a fake E-Stop command."""
+        if emo_active is True:
+            self.estop_button.setText("EMO\nACTIVE")
+            self.estop_button.setProperty("emoActive", True)
+            self.estop_button.setToolTip(
+                "Physical EMO is ACTIVE. Release the hardware EMO only after "
+                "the robot and workspace are safe."
+            )
+        elif emo_active is False:
+            self.estop_button.setText("E-STOP\nHW ONLY")
+            self.estop_button.setProperty("emoActive", False)
+            self.estop_button.setToolTip(
+                "No supported software E-Stop command is exposed by the "
+                "current public RB-Y1 ROS2/SDK interface. Use the physical "
+                "EMO remote for emergency stop."
+            )
+        else:
+            self.estop_button.setText("E-STOP\nUNKNOWN")
+            self.estop_button.setProperty("emoActive", False)
+            self.estop_button.setToolTip(
+                "EMO feedback is unavailable. Verify /rby1/robot_state and "
+                "keep the physical EMO remote accessible."
+            )
+
+        # This is intentionally never clickable: MOTION STOP remains the
+        # software stop path, while this widget mirrors hardware EMO state.
+        self.estop_button.setEnabled(False)
+        self.estop_button.style().unpolish(self.estop_button)
+        self.estop_button.style().polish(self.estop_button)
 
     def _build_current_command_group(self) -> QGroupBox:
         group = QGroupBox("Current Base Command")
@@ -1726,8 +1770,10 @@ class MainWindow(QMainWindow):
             if snapshot.emo_active is True
             else "RELEASED"
             if snapshot.emo_active is False
-            else "unknown"
+            else "UNKNOWN"
         )
+
+        self._set_estop_status(snapshot.emo_active)
 
         self.collision_value.setText(
             "ACTIVE"
@@ -1737,12 +1783,18 @@ class MainWindow(QMainWindow):
             else "unknown"
         )
 
+        control_manager_ready = False
+
         if snapshot.services_enabled:
             ready = snapshot.service_ready
+            control_manager_ready = bool(
+                ready.get("control_manager", False)
+            )
             service_items = (
                 ("power", "PWR"),
                 ("servo", "SRV"),
                 ("stream", "STR"),
+                ("control_manager", "CM"),
                 ("joint_action", "JNT"),
                 ("cartesian_action", "TCP"),
                 ("cartesian_pose", "POSE"),
@@ -1776,6 +1828,13 @@ class MainWindow(QMainWindow):
             widget.setEnabled(
                 snapshot.services_enabled
             )
+
+        for widget in (
+            self.control_manager_enable_button,
+            self.control_manager_disable_button,
+            self.control_manager_reset_button,
+        ):
+            widget.setEnabled(control_manager_ready)
 
         # Day 2 motion state, when the backend provides it.
         self._refresh_motion_state()
@@ -1970,6 +2029,12 @@ class MainWindow(QMainWindow):
                 background: #5f3030;
                 color: #c7a0a0;
                 border: 2px solid #754343;
+            }
+
+            QPushButton#eStopButton[emoActive="true"]:disabled {
+                background: #b42323;
+                color: white;
+                border: 2px solid #ff6b6b;
             }
 
             QDoubleSpinBox,
