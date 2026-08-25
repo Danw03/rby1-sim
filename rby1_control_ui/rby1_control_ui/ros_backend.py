@@ -367,6 +367,19 @@ class Rby1ControlNode(Node):
             'left_arm': None,
         }
 
+        self._cartesian_snapshot: Dict[
+            str,
+            Optional[List[float]],
+        ] = {
+            'right_arm': None,
+            'left_arm': None,
+        }
+
+        self._cartesian_snapshot_pending = {
+            'right_arm': False,
+            'left_arm': False,
+        }
+
         self._cartesian_request_pending = {
             'right_arm': False,
             'left_arm': False,
@@ -696,6 +709,25 @@ class Rby1ControlNode(Node):
                 )
             )
 
+    def _transform_to_pose(self, transform) -> List[float]:
+        roll_deg, pitch_deg, yaw_deg = (
+            self._quaternion_to_rpy_deg(
+                float(transform.rotation.x),
+                float(transform.rotation.y),
+                float(transform.rotation.z),
+                float(transform.rotation.w),
+            )
+        )
+
+        return [
+            float(transform.translation.x),
+            float(transform.translation.y),
+            float(transform.translation.z),
+            roll_deg,
+            pitch_deg,
+            yaw_deg,
+        ]
+    
     def _cartesian_pose_done(
         self,
         future,
@@ -717,28 +749,35 @@ class Rby1ControlNode(Node):
         if response is None:
             return
 
-        transform = response.transform
-
-        roll_deg, pitch_deg, yaw_deg = (
-            self._quaternion_to_rpy_deg(
-                float(transform.rotation.x),
-                float(transform.rotation.y),
-                float(transform.rotation.z),
-                float(transform.rotation.w),
-            )
-        )
-
-        pose = [
-            float(transform.translation.x),
-            float(transform.translation.y),
-            float(transform.translation.z),
-            roll_deg,
-            pitch_deg,
-            yaw_deg,
-        ]
+        pose = self._transform_to_pose(response.transform)
 
         with self._lock:
             self._cartesian_state[arm] = pose
+
+    def _cartesian_snapshot_done(
+        self,
+        future,
+        arm: str,
+        ) -> None:
+        self._discard_future(future)
+        self._cartesian_snapshot_pending[arm] = False
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            self._push_event(
+                'warning',
+                f'Get TCP failed for {arm}: {exc}',
+            )
+            return
+
+        if response is None:
+            return
+
+        pose = self._transform_to_pose(response.transform)
+
+        with self._lock:
+            self._cartesian_snapshot[arm] = pose   
 
     @staticmethod
     def _quaternion_to_rpy_deg(
@@ -821,6 +860,81 @@ class Rby1ControlNode(Node):
             'joint_groups': joint_groups,
             'cartesian': cartesian,
         }
+
+    def request_cartesian_snapshot(self, arm: str) -> bool:
+        """Request a fresh Cartesian pose snapshot."""
+
+        if arm not in self.cartesian_links:
+            return False
+
+        if (
+            not self.services_enabled
+            or self.cartesian_pose_client is None
+            or GetCartesianPose is None
+        ):
+            return False
+
+        if not self.cartesian_pose_client.service_is_ready():
+            self._push_event(
+                'warning',
+                'GetCartesianPose service is not ready.',
+            )
+            return False
+
+        if self._cartesian_snapshot_pending[arm]:
+            return False
+
+        ref_link, target_link = self.cartesian_links[arm]
+
+        request = GetCartesianPose.Request()
+        request.ref_link = ref_link
+        request.target_link = target_link
+
+        # 이전 snapshot을 지운다.
+        with self._lock:
+            self._cartesian_snapshot[arm] = None
+
+        future = self.cartesian_pose_client.call_async(request)
+
+        self._cartesian_snapshot_pending[arm] = True
+        self._pending_futures.append(future)
+
+        future.add_done_callback(
+            lambda done, arm_name=arm:
+            self._cartesian_snapshot_done(
+                done,
+                arm_name,
+            )
+        )
+
+        return True
+    
+    def get_cartesian_snapshot(
+        self,
+        arm: str,
+    ) -> Optional[List[float]]:
+
+        with self._lock:
+            values = self._cartesian_snapshot.get(arm)
+
+            if values is None:
+                return None
+
+            return list(values)
+        
+    def get_joint_snapshot(
+        self,
+        group: str,
+        ) -> Optional[List[float]]:
+        """Return a copy of the latest joint state in degrees."""
+
+        with self._lock:
+            values = self._joint_groups_deg.get(group)
+
+            if values is None:
+                return None
+
+        return list(values)
 
     def _motion_command_allowed(self) -> bool:
         """Common safety gate before sending a manipulation goal."""

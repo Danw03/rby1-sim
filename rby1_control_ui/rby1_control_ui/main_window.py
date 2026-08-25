@@ -662,6 +662,35 @@ class MainWindow(QMainWindow):
         selector_layout.addRow("Component", self.joint_group_selector)
         root.addWidget(selector_group)
 
+        #------------Get q button and snapshot display---------------------
+        snapshot_group = QGroupBox("Joint Snapshot")
+        snapshot_layout = QGridLayout(snapshot_group)
+        snapshot_layout.setHorizontalSpacing(6)
+        snapshot_layout.setVerticalSpacing(3)
+
+        self.get_q_button = QPushButton("Get q")
+        self.get_q_button.clicked.connect(self._get_joint_snapshot)
+
+        snapshot_layout.addWidget(self.get_q_button, 1, 0)
+
+        self.joint_snapshot_headers = []
+        self.joint_snapshot_values = []
+
+        for index in range(7):
+            header = QLabel(f"J{index + 1}")
+            value = QLabel("--")
+
+            header.setAlignment(alignment("AlignCenter"))
+            value.setAlignment(alignment("AlignCenter"))
+
+            self.joint_snapshot_headers.append(header)
+            self.joint_snapshot_values.append(value)
+
+            snapshot_layout.addWidget(header, 0, index + 1)
+            snapshot_layout.addWidget(value, 1, index + 1)
+
+        root.addWidget(snapshot_group)
+
         # --------------------------------------------------------------
         # Current / target / jog table
         # --------------------------------------------------------------
@@ -801,6 +830,62 @@ class MainWindow(QMainWindow):
         selector_layout.addRow("Arm", self.cartesian_arm_selector)
         root.addWidget(selector_group)
 
+        snapshot_group = QGroupBox("TCP Snapshot")
+        snapshot_layout = QGridLayout(snapshot_group)
+        snapshot_layout.setHorizontalSpacing(8)
+        snapshot_layout.setVerticalSpacing(3)
+
+        snapshot_names = (
+            "X", "Y", "Z",
+            "Roll", "Pitch", "Yaw",
+        )
+
+        self.tcp_snapshot_values = []
+
+        for index, name in enumerate(snapshot_names):
+            if index < 3:
+                header_row = 0
+                value_row = 1
+                column = index
+            else:
+                header_row = 2
+                value_row = 3
+                column = index - 3
+
+            header = QLabel(name)
+            value = QLabel("--")
+
+            header.setAlignment(alignment("AlignCenter"))
+            value.setAlignment(alignment("AlignCenter"))
+
+            snapshot_layout.addWidget(
+                header,
+                header_row,
+                column,
+            )
+            snapshot_layout.addWidget(
+                value,
+                value_row,
+                column,
+            )
+
+            self.tcp_snapshot_values.append(value)
+
+        self.get_tcp_button = QPushButton("Get TCP")
+        self.get_tcp_button.clicked.connect(
+            self._get_cartesian_snapshot
+        )
+
+        snapshot_layout.addWidget(
+            self.get_tcp_button,
+            0,
+            3,
+            4,
+            1,
+        )
+
+        root.addWidget(snapshot_group)
+
         # --------------------------------------------------------------
         # Cartesian current / target / jog table
         # Same interaction pattern as Joint Space Motion.
@@ -938,6 +1023,38 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _selected_joint_group(self) -> str:
         return str(self.joint_group_selector.currentData())
+    
+    def _get_joint_snapshot(self) -> None:
+        group = self._selected_joint_group()
+
+        if not hasattr(self.backend, "get_joint_snapshot"):
+            self.append_log(
+                "warning",
+                "Get q is not available in this backend.",
+            )
+            return
+
+        values = self.backend.get_joint_snapshot(group)
+
+        if values is None:
+            self.append_log(
+                "warning",
+                "No joint state is available.",
+            )
+            return
+
+        _, dof = self.JOINT_GROUPS[group]
+
+        for index in range(7):
+            visible = index < dof
+
+            self.joint_snapshot_headers[index].setVisible(visible)
+            self.joint_snapshot_values[index].setVisible(visible)
+
+            if visible:
+                self.joint_snapshot_values[index].setText(
+                    f"{values[index]:.2f}"
+                )
 
     def _on_joint_group_changed(self, *args) -> None:
         del args
@@ -960,6 +1077,15 @@ class MainWindow(QMainWindow):
             self.joint_target_spins[index].blockSignals(True)
             self.joint_target_spins[index].setValue(cached_targets[index])
             self.joint_target_spins[index].blockSignals(False)
+
+        if hasattr(self, "joint_snapshot_headers"):
+            for index in range(7):
+                visible = index < dof
+
+                self.joint_snapshot_headers[index].setVisible(visible)
+                self.joint_snapshot_values[index].setVisible(visible)
+
+                self.joint_snapshot_values[index].setText("--")
 
         if hasattr(self, "log_view"):
             self.append_log(
@@ -1052,6 +1178,33 @@ class MainWindow(QMainWindow):
     def _selected_cartesian_arm(self) -> str:
         return str(self.cartesian_arm_selector.currentData())
 
+    def _get_cartesian_snapshot(self) -> None:
+        arm = self._selected_cartesian_arm()
+
+        if not hasattr(
+            self.backend,
+            "request_cartesian_snapshot",
+        ):
+            self.append_log(
+                "warning",
+                "Get TCP is not available in this backend.",
+            )
+            return
+
+        requested = self.backend.request_cartesian_snapshot(
+            arm
+        )
+
+        if not requested:
+            self.append_log(
+                "warning",
+                "Get TCP request could not be started.",
+            )
+            return
+
+        for label in self.tcp_snapshot_values:
+            label.setText("...")
+
     def _on_cartesian_arm_changed(self, *args) -> None:
         del args
         if not hasattr(self, "cartesian_arm_selector"):
@@ -1070,6 +1223,10 @@ class MainWindow(QMainWindow):
                 "info",
                 f"Cartesian arm selected: {self.CARTESIAN_ARMS[arm]}.",
             )
+
+        if hasattr(self, "tcp_snapshot_values"):
+            for label in self.tcp_snapshot_values:
+                label.setText("--")
 
     def _on_cartesian_target_changed(
         self,
@@ -1218,6 +1375,33 @@ class MainWindow(QMainWindow):
                     self.cartesian_current_labels[index].setText(
                         f"{value:+.2f}°"
                     )
+
+        if hasattr(
+            self.backend,
+            "get_cartesian_snapshot",
+        ):
+            arm = self._selected_cartesian_arm()
+
+            snapshot = self.backend.get_cartesian_snapshot(
+                arm
+            )
+
+            if snapshot is not None:
+                for index in range(6):
+                    if index >= len(snapshot):
+                        self.tcp_snapshot_values[index].setText("--")
+                        continue
+
+                    value = float(snapshot[index])
+
+                    if index < 3:
+                        self.tcp_snapshot_values[index].setText(
+                            f"{value:+.4f}"
+                        )
+                    else:
+                        self.tcp_snapshot_values[index].setText(
+                            f"{value:+.2f}°"
+                        )
 
     def _build_scenario_tab(self) -> QWidget:
         return self._placeholder(
