@@ -51,6 +51,16 @@ from .qt_compat import (
 
 
 class MainWindow(QMainWindow):
+
+    CONTROL_STATE_NAMES = {
+        0: "NONE",
+        1: "IDLE",
+        2: "ENABLE",
+        3: "EXECUTING",
+        4: "MAJOR FAULT",
+        5: "MINOR FAULT",
+    }
+
     ACTION_FORWARD = "forward"
     ACTION_BACKWARD = "backward"
     ACTION_LEFT = "left"
@@ -1250,6 +1260,14 @@ class MainWindow(QMainWindow):
 
         delta *= float(direction)
 
+        axis_names = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
+        self.append_log(
+            "info",
+            f"[UI JOG] {arm} "
+            f"axis={axis_names[axis_index]}, "
+            f"delta={delta:+.3f}",
+        )
+
         if not hasattr(self.backend, "jog_cartesian"):
             self.append_log(
                 "warning",
@@ -1668,11 +1686,15 @@ class MainWindow(QMainWindow):
             str(snapshot.cmd_vel_subscribers)
         )
 
-        self.state_value.setText(
-            "unknown"
-            if snapshot.control_state is None
-            else str(snapshot.control_state)
-        )
+        if snapshot.control_state is None:
+            control_state_text = "UNKNOWN"
+        else:
+            control_state_text = self.CONTROL_STATE_NAMES.get(
+                int(snapshot.control_state),
+                f"UNKNOWN ({snapshot.control_state})",
+            )
+
+        self.state_value.setText(control_state_text)
 
         self.stream_value.setText(
             "ON"

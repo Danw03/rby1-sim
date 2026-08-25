@@ -367,6 +367,19 @@ class Rby1ControlNode(Node):
             'left_arm': None,
         }
 
+        # Keep the measured orientation in quaternion form for Cartesian
+        # angular jogs. RPY is retained separately only for UI display.
+        # Converting quaternion -> RPY -> quaternion for every jog makes the
+        # jog axes depend on the Euler-angle sequence and becomes singular at
+        # pitch +/- 90 degrees.
+        self._cartesian_quaternion_state: Dict[
+            str,
+            Optional[Tuple[float, float, float, float]],
+        ] = {
+            'right_arm': None,
+            'left_arm': None,
+        }
+
         self._cartesian_snapshot: Dict[
             str,
             Optional[List[float]],
@@ -710,12 +723,16 @@ class Rby1ControlNode(Node):
             )
 
     def _transform_to_pose(self, transform) -> List[float]:
+        quaternion = self._normalize_quaternion(
+            float(transform.rotation.x),
+            float(transform.rotation.y),
+            float(transform.rotation.z),
+            float(transform.rotation.w),
+        )
+
         roll_deg, pitch_deg, yaw_deg = (
             self._quaternion_to_rpy_deg(
-                float(transform.rotation.x),
-                float(transform.rotation.y),
-                float(transform.rotation.z),
-                float(transform.rotation.w),
+                *quaternion,
             )
         )
 
@@ -749,10 +766,24 @@ class Rby1ControlNode(Node):
         if response is None:
             return
 
-        pose = self._transform_to_pose(response.transform)
+        try:
+            pose = self._transform_to_pose(response.transform)
+            quaternion = self._normalize_quaternion(
+                float(response.transform.rotation.x),
+                float(response.transform.rotation.y),
+                float(response.transform.rotation.z),
+                float(response.transform.rotation.w),
+            )
+        except ValueError as exc:
+            self._push_event(
+                'warning',
+                f'Invalid Cartesian pose for {arm}: {exc}',
+            )
+            return
 
         with self._lock:
             self._cartesian_state[arm] = pose
+            self._cartesian_quaternion_state[arm] = quaternion
 
     def _cartesian_snapshot_done(
         self,
@@ -774,7 +805,14 @@ class Rby1ControlNode(Node):
         if response is None:
             return
 
-        pose = self._transform_to_pose(response.transform)
+        try:
+            pose = self._transform_to_pose(response.transform)
+        except ValueError as exc:
+            self._push_event(
+                'warning',
+                f'Invalid TCP snapshot for {arm}: {exc}',
+            )
+            return
 
         with self._lock:
             self._cartesian_snapshot[arm] = pose   
@@ -831,6 +869,63 @@ class Rby1ControlNode(Node):
         z = cr * cp * sy - sr * sp * cy
 
         return x, y, z, w
+
+    @staticmethod
+    def _normalize_quaternion(
+        x: float,
+        y: float,
+        z: float,
+        w: float,
+    ) -> Tuple[float, float, float, float]:
+        """Return a unit quaternion in x/y/z/w order."""
+
+        values = (float(x), float(y), float(z), float(w))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError('quaternion contains a non-finite value')
+
+        norm = math.sqrt(sum(value * value for value in values))
+        if norm < 1.0e-12:
+            raise ValueError('quaternion has zero length')
+
+        return tuple(value / norm for value in values)
+
+    @staticmethod
+    def _multiply_quaternions(
+        left: Tuple[float, float, float, float],
+        right: Tuple[float, float, float, float],
+    ) -> Tuple[float, float, float, float]:
+        """Hamilton product of x/y/z/w quaternions: left * right."""
+
+        lx, ly, lz, lw = left
+        rx, ry, rz, rw = right
+
+        return (
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        )
+
+    @staticmethod
+    def _axis_angle_deg_to_quaternion(
+        axis_index: int,
+        angle_deg: float,
+    ) -> Tuple[float, float, float, float]:
+        """Create a quaternion for X/Y/Z axis_index and angle in degrees."""
+
+        if axis_index < 0 or axis_index >= 3:
+            raise ValueError(f'invalid rotation axis {axis_index}')
+
+        half_angle = math.radians(float(angle_deg)) * 0.5
+        vector = [0.0, 0.0, 0.0]
+        vector[axis_index] = math.sin(half_angle)
+
+        return (
+            vector[0],
+            vector[1],
+            vector[2],
+            math.cos(half_angle),
+        )
 
     def get_motion_state(self) -> Dict[str, object]:
         """Return cached joint and Cartesian state for the Qt GUI."""
@@ -1166,17 +1261,39 @@ class Rby1ControlNode(Node):
         delta: float,
         reference_frame: str = 'base',
     ) -> None:
-        """Jog one Cartesian component from the latest absolute pose."""
+        """Jog one Cartesian component from the latest measured pose.
 
-        del reference_frame
+        Linear jogs add to translation in the configured reference frame.
+        Angular jogs compose a delta quaternion on the left, so Roll/Pitch/Yaw
+        consistently mean rotations about the reference-frame X/Y/Z axes.
+        """
 
         with self._lock:
             current = self._cartesian_state.get(arm)
+            current_quaternion = (
+                self._cartesian_quaternion_state.get(arm)
+                if hasattr(self, '_cartesian_quaternion_state')
+                else None
+            )
+
+            snapshot = (
+                self._cartesian_snapshot.get(arm)
+                if hasattr(self, "_cartesian_snapshot")
+                else None
+            )
+
             target = (
                 list(current)
                 if current is not None
                 else None
             )
+
+        self._push_event(
+            "info",
+            f"[CS SOURCE] {arm} "
+            f"live={current}, "
+            f"snapshot={snapshot}",
+        )
 
         if target is None:
             self._push_event(
@@ -1194,13 +1311,56 @@ class Rby1ControlNode(Node):
             )
             return
 
-        target[axis_index] += float(delta)
+        #---Log A: log the current and target pose---
+        current_pose = list(target)
 
-        self.move_cartesian(
+        if current_quaternion is None:
+            self._push_event(
+                'warning',
+                f'Cartesian jog rejected: '
+                f'no current quaternion for {arm}.',
+            )
+            return
+
+        translation = list(current_pose[:3])
+
+        if axis_index < 3:
+            translation[axis_index] += float(delta)
+            target_quaternion = current_quaternion
+        else:
+            delta_quaternion = self._axis_angle_deg_to_quaternion(
+                axis_index - 3,
+                float(delta),
+            )
+
+            # Left multiplication applies the delta around an axis of the
+            # reference frame (Base in the current UI).
+            composed = self._multiply_quaternions(
+                delta_quaternion,
+                current_quaternion,
+            )
+            target_quaternion = self._normalize_quaternion(*composed)
+
+        target_rpy = self._quaternion_to_rpy_deg(*target_quaternion)
+        target = translation + list(target_rpy)
+
+        axis_names = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
+
+        self._push_event(
+            "info",
+            f"[CS JOG] {arm} "
+            f"axis={axis_names[axis_index]}, "
+            f"current={['%.3f' % v for v in current_pose]}, "
+            f"target={['%.3f' % v for v in target]}",
+        )
+
+        self._move_cartesian_quaternion(
             arm,
-            target,
+            translation,
+            target_quaternion,
             self.cartesian_jog_minimum_time_sec,
             reference_frame='base',
+            log_rpy=target_rpy,
         )
 
     def move_cartesian(
@@ -1235,6 +1395,65 @@ class Rby1ControlNode(Node):
             self._push_event(
                 'error',
                 'Non-finite Cartesian target rejected.',
+            )
+            return
+
+        quaternion = self._rpy_deg_to_quaternion(
+            values[3],
+            values[4],
+            values[5],
+        )
+
+        self._move_cartesian_quaternion(
+            arm,
+            values[:3],
+            quaternion,
+            minimum_time,
+            reference_frame=reference_frame,
+            log_rpy=(values[3], values[4], values[5]),
+        )
+
+    def _move_cartesian_quaternion(
+        self,
+        arm: str,
+        translation: List[float],
+        quaternion: Tuple[float, float, float, float],
+        minimum_time: float,
+        reference_frame: str = 'base',
+        log_rpy: Optional[Tuple[float, float, float]] = None,
+    ) -> None:
+        """Send an absolute Cartesian target using a quaternion directly."""
+
+        if arm not in ('right_arm', 'left_arm'):
+            self._push_event(
+                'error',
+                f'Unknown Cartesian arm: {arm}.',
+            )
+            return
+
+        if len(translation) != 3 or len(quaternion) != 4:
+            self._push_event(
+                'error',
+                'Cartesian quaternion target must contain 3 translation '
+                'and 4 rotation values.',
+            )
+            return
+
+        position = [float(value) for value in translation]
+
+        if not all(math.isfinite(value) for value in position):
+            self._push_event(
+                'error',
+                'Non-finite Cartesian translation rejected.',
+            )
+            return
+
+        try:
+            qx, qy, qz, qw = self._normalize_quaternion(*quaternion)
+        except ValueError as exc:
+            self._push_event(
+                'error',
+                f'Invalid Cartesian quaternion rejected: {exc}.',
             )
             return
 
@@ -1275,16 +1494,23 @@ class Rby1ControlNode(Node):
         command.ref_link = ref_link
         command.target_link = target_link
 
-        command.transform.translation.x = values[0]
-        command.transform.translation.y = values[1]
-        command.transform.translation.z = values[2]
+        command.transform.translation.x = position[0]
+        command.transform.translation.y = position[1]
+        command.transform.translation.z = position[2]
 
-        qx, qy, qz, qw = self._rpy_deg_to_quaternion(
-            values[3],
-            values[4],
-            values[5],
+        if log_rpy is None:
+            log_rpy = self._quaternion_to_rpy_deg(qx, qy, qz, qw)
+
+        #---Log B: log the target pose in RPY and quaternion---#
+        self._push_event(
+            "info",
+            f"[CS QUAT] {arm} "
+            f"RPY=({log_rpy[0]:+.3f}, "
+            f"{log_rpy[1]:+.3f}, "
+            f"{log_rpy[2]:+.3f}) deg, "
+            f"Q=({qx:+.6f}, {qy:+.6f}, "
+            f"{qz:+.6f}, {qw:+.6f})",
         )
-
         command.transform.rotation.x = qx
         command.transform.rotation.y = qy
         command.transform.rotation.z = qz
