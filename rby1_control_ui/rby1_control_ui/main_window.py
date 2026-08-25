@@ -1,21 +1,16 @@
-"""Day 1 Qt shell for RB-Y1 M v1.3 control UI.
+"""Qt operator UI for RB-Y1 M v1.3.
 
 Layout policy
 -------------
 Always visible:
-- global MOTION STOP
-- backend mode
-- robot state / safety state
 - Power / Servo / Stream controls
-- current base command
-- compact ROS connection summary
-- event log
+- Control Manager command area
+- compact robot / safety state
+- E-Stop command area (UI only until backend connection is verified)
 
-Tabs:
-- Base
-- Joints
-- Scenario
-- Diagnostics
+Each tab provides a software MOTION STOP.
+Space triggers the same MOTION STOP action.
+UI event logging is written to the terminal rather than an on-screen log panel.
 """
 
 from __future__ import annotations
@@ -105,9 +100,7 @@ class MainWindow(QMainWindow):
         }
         self._latest_motion_state = {}
 
-        self.setWindowTitle(
-            f"RB-Y1 M v1.3 Control · {self.backend_name}"
-        )
+        self.setWindowTitle("RB-Y1")
 
         # Compact enough to sit beside MuJoCo on a normal desktop.
         self.setMinimumSize(760, 700)
@@ -121,11 +114,8 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        # Always visible: identity, essential safety state, global stop.
-        root.addWidget(self._build_header())
-
-        # Always available, but compressed into one operator row.
-        root.addWidget(self._build_robot_service_group())
+        # Always-visible robot operation / safety panel.
+        root.addWidget(self._build_fixed_top_panel())
 
         # Task-specific controls.
         self.tabs = QTabWidget()
@@ -141,8 +131,6 @@ class MainWindow(QMainWindow):
         )
         root.addWidget(self.tabs, 1)
 
-        # Keep only a shallow live log. Full ROS details are in Diagnostics.
-        root.addWidget(self._build_log_panel(), 0)
 
         self._apply_style()
 
@@ -169,166 +157,206 @@ class MainWindow(QMainWindow):
         self.refresh_backend_status()
 
     # ==================================================================
-    # Fixed header
+    # Fixed top operator / safety panel
     # ==================================================================
-    def _build_header(self) -> QWidget:
+    def _build_fixed_top_panel(self) -> QWidget:
         frame = QFrame()
         frame.setObjectName("headerFrame")
 
         layout = QHBoxLayout(frame)
-        layout.setContentsMargins(9, 6, 9, 6)
-        layout.setSpacing(7)
+        layout.setContentsMargins(7, 6, 7, 6)
+        layout.setSpacing(6)
 
-        title = QLabel("RB-Y1 Control")
-        font = QFont()
-        font.setPointSize(14)
-        font.setBold(True)
-        title.setFont(font)
+        # --------------------------------------------------------------
+        # Power
+        # --------------------------------------------------------------
+        power_group = QGroupBox("Power")
+        power_layout = QVBoxLayout(power_group)
+        power_layout.setContentsMargins(5, 6, 5, 5)
+        power_layout.setSpacing(4)
 
-        layout.addWidget(title)
+        self.power_on_button = QPushButton("ON")
+        self.power_off_button = QPushButton("OFF")
+        self.power_on_button.clicked.connect(
+            lambda: self.backend.request_power(True)
+        )
+        self.power_off_button.clicked.connect(
+            lambda: self.backend.request_power(False)
+        )
 
-        self.backend_badge = QLabel(self.backend_name)
-        self.backend_badge.setObjectName("backendBadge")
-        layout.addWidget(self.backend_badge)
+        power_layout.addWidget(self.power_on_button)
+        power_layout.addWidget(self.power_off_button)
 
-        layout.addStretch(1)
+        # --------------------------------------------------------------
+        # Servo
+        # --------------------------------------------------------------
+        servo_group = QGroupBox("Servo")
+        servo_layout = QVBoxLayout(servo_group)
+        servo_layout.setContentsMargins(5, 6, 5, 5)
+        servo_layout.setSpacing(4)
 
-        self.state_value = QLabel("unknown")
-        self.stream_value = QLabel("unknown")
-        self.emo_value = QLabel("unknown")
-        self.collision_value = QLabel("unknown")
+        self.servo_on_button = QPushButton("ON")
+        self.servo_off_button = QPushButton("OFF")
+        self.servo_on_button.clicked.connect(
+            lambda: self.backend.request_servo(True)
+        )
+        self.servo_off_button.clicked.connect(
+            lambda: self.backend.request_servo(False)
+        )
+
+        servo_layout.addWidget(self.servo_on_button)
+        servo_layout.addWidget(self.servo_off_button)
+
+        # --------------------------------------------------------------
+        # Stream
+        # --------------------------------------------------------------
+        stream_group = QGroupBox("Stream")
+        stream_layout = QVBoxLayout(stream_group)
+        stream_layout.setContentsMargins(5, 6, 5, 5)
+        stream_layout.setSpacing(4)
+
+        self.stream_on_button = QPushButton("ON")
+        self.stream_off_button = QPushButton("OFF")
+        self.stream_on_button.clicked.connect(
+            lambda: self.backend.request_stream(True)
+        )
+        self.stream_off_button.clicked.connect(self._stream_off)
+
+        stream_layout.addWidget(self.stream_on_button)
+        stream_layout.addWidget(self.stream_off_button)
+
+        # --------------------------------------------------------------
+        # Control Manager
+        # UI skeleton first. Commands will be connected in the next step.
+        # --------------------------------------------------------------
+        control_manager_group = QGroupBox("Control Manager")
+        control_manager_layout = QGridLayout(control_manager_group)
+        control_manager_layout.setContentsMargins(5, 6, 5, 5)
+        control_manager_layout.setSpacing(4)
+
+        self.control_manager_enable_button = QPushButton("ENABLE")
+        self.control_manager_disable_button = QPushButton("DISABLE")
+        self.control_manager_reset_button = QPushButton("RESET")
+
+        for button in (
+            self.control_manager_enable_button,
+            self.control_manager_disable_button,
+            self.control_manager_reset_button,
+        ):
+            button.setEnabled(False)
+            button.setToolTip(
+                "Control Manager command will be connected next."
+            )
+
+        control_manager_layout.addWidget(
+            self.control_manager_enable_button, 0, 0
+        )
+        control_manager_layout.addWidget(
+            self.control_manager_disable_button, 1, 0
+        )
+        control_manager_layout.addWidget(
+            self.control_manager_reset_button, 0, 1, 2, 1
+        )
+
+        # --------------------------------------------------------------
+        # State: two side-by-side columns, matching the requested sketch.
+        #
+        # Power    ● ...      Control    ...
+        # Servo    ● ...      EMO        ...
+        # Stream   ● ...      Collision  ...
+        # --------------------------------------------------------------
+        state_group = QGroupBox("State")
+        state_layout = QGridLayout(state_group)
+        state_layout.setContentsMargins(8, 6, 8, 5)
+        state_layout.setHorizontalSpacing(8)
+        state_layout.setVerticalSpacing(4)
+
+        # Power / Servo do not currently have independent feedback in
+        # BackendSnapshot, so they intentionally remain UNKNOWN for now.
+        self.power_state_value = self._status_indicator()
+        self.servo_state_value = self._status_indicator()
+        self.stream_value = self._status_indicator()
+
+        self.state_value = QLabel("UNKNOWN")
+        self.emo_value = QLabel("UNKNOWN")
+        self.collision_value = QLabel("UNKNOWN")
 
         for value in (
             self.state_value,
-            self.stream_value,
             self.emo_value,
             self.collision_value,
         ):
             value.setObjectName("stateValue")
 
-        layout.addWidget(QLabel("Control"))
-        layout.addWidget(self.state_value)
-        layout.addWidget(QLabel("Stream"))
-        layout.addWidget(self.stream_value)
-        layout.addWidget(QLabel("EMO"))
-        layout.addWidget(self.emo_value)
-        layout.addWidget(QLabel("Collision"))
-        layout.addWidget(self.collision_value)
+        # Left state column.
+        state_layout.addWidget(QLabel("Power"), 0, 0)
+        state_layout.addWidget(self.power_state_value, 0, 1)
+        state_layout.addWidget(QLabel("Servo"), 1, 0)
+        state_layout.addWidget(self.servo_state_value, 1, 1)
+        state_layout.addWidget(QLabel("Stream"), 2, 0)
+        state_layout.addWidget(self.stream_value, 2, 1)
 
-        self.stop_button = QPushButton("MOTION STOP")
-        self.stop_button.setObjectName("emergencyStop")
-        self.stop_button.setMinimumHeight(34)
-        self.stop_button.setMinimumWidth(110)
-        self.stop_button.clicked.connect(self.emergency_stop)
-        layout.addWidget(self.stop_button)
+        # Visual gap between the two state columns.
+        state_layout.setColumnMinimumWidth(2, 10)
+
+        # Right state column.
+        state_layout.addWidget(QLabel("Control"), 0, 3)
+        state_layout.addWidget(self.state_value, 0, 4)
+        state_layout.addWidget(QLabel("EMO"), 1, 3)
+        state_layout.addWidget(self.emo_value, 1, 4)
+        state_layout.addWidget(QLabel("Collision"), 2, 3)
+        state_layout.addWidget(self.collision_value, 2, 4)
+
+        state_layout.setColumnStretch(1, 1)
+        state_layout.setColumnStretch(4, 1)
+
+        # --------------------------------------------------------------
+        # E-Stop
+        # Layout only for now. Do not connect this to MOTION STOP.
+        # --------------------------------------------------------------
+        self.estop_button = QPushButton("ESTOP")
+        self.estop_button.setObjectName("eStopButton")
+        self.estop_button.setMinimumWidth(95)
+        self.estop_button.setMinimumHeight(74)
+        self.estop_button.setEnabled(False)
+        self.estop_button.setToolTip(
+            "E-Stop command is not connected yet."
+        )
+
+        layout.addWidget(power_group)
+        layout.addWidget(servo_group)
+        layout.addWidget(stream_group)
+        layout.addWidget(control_manager_group)
+        layout.addWidget(state_group, 2)
+        layout.addWidget(self.estop_button)
 
         return frame
 
-    # ==================================================================
-    # Fixed left sidebar
-    # ==================================================================
-    def _build_fixed_status_panel(self) -> QWidget:
-        panel = QWidget()
-        panel.setObjectName("fixedSidebar")
-        panel.setMinimumWidth(285)
-        panel.setMaximumWidth(350)
+    @staticmethod
+    def _status_indicator() -> QLabel:
+        label = QLabel("● UNKNOWN")
+        label.setMinimumWidth(82)
+        label.setObjectName("statusUnknown")
+        return label
 
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(9)
+    @staticmethod
+    def _set_status_indicator(
+        label: QLabel,
+        state,
+    ) -> None:
+        if state is True:
+            label.setText("● ON")
+            label.setObjectName("statusOn")
+        elif state is False:
+            label.setText("● OFF")
+            label.setObjectName("statusOff")
+        else:
+            label.setText("● UNKNOWN")
+            label.setObjectName("statusUnknown")
 
-        # Highest priority: robot/safety state.
-        layout.addWidget(self._build_robot_state_group())
-
-        # High priority: controls required to prepare or disable the robot.
-        layout.addWidget(self._build_robot_service_group())
-
-        # Useful on every tab: what base command is currently being requested.
-        layout.addWidget(self._build_current_command_group())
-
-        # Keep only a compact connection summary fixed.
-        # Detailed ROS inspection remains in Diagnostics.
-        layout.addWidget(self._build_connection_group())
-
-        # Compact warning rather than a large permanent safety text block.
-        layout.addWidget(self._build_safety_note_group())
-
-        layout.addStretch(1)
-        return panel
-
-    def _build_robot_state_group(self) -> QGroupBox:
-        group = QGroupBox("Robot State")
-        form = QFormLayout(group)
-
-        self.state_value = QLabel("unknown")
-        self.stream_value = QLabel("unknown")
-        self.emo_value = QLabel("unknown")
-        self.collision_value = QLabel("unknown")
-
-        self.state_value.setObjectName("stateValue")
-        self.stream_value.setObjectName("stateValue")
-        self.emo_value.setObjectName("stateValue")
-        self.collision_value.setObjectName("stateValue")
-
-        form.addRow("Control", self.state_value)
-        form.addRow("Stream", self.stream_value)
-        form.addRow("EMO", self.emo_value)
-        form.addRow("Collision", self.collision_value)
-
-        return group
-
-    def _build_robot_service_group(self) -> QGroupBox:
-        group = QGroupBox("Robot")
-        layout = QHBoxLayout(group)
-        layout.setContentsMargins(7, 6, 7, 6)
-        layout.setSpacing(5)
-
-        self.prepare_button = QPushButton("Prepare")
-        self.prepare_button.clicked.connect(
-            self.backend.prepare_robot
-        )
-
-        self.power_on_button = QPushButton("Power ON")
-        self.power_on_button.clicked.connect(
-            lambda: self.backend.request_power(True)
-        )
-
-        self.power_off_button = QPushButton("Power OFF")
-        self.power_off_button.clicked.connect(
-            lambda: self.backend.request_power(False)
-        )
-
-        self.servo_on_button = QPushButton("Servo ON")
-        self.servo_on_button.clicked.connect(
-            lambda: self.backend.request_servo(True)
-        )
-
-        self.servo_off_button = QPushButton("Servo OFF")
-        self.servo_off_button.clicked.connect(
-            lambda: self.backend.request_servo(False)
-        )
-
-        self.stream_on_button = QPushButton("Stream ON")
-        self.stream_on_button.clicked.connect(
-            lambda: self.backend.request_stream(True)
-        )
-
-        self.stream_off_button = QPushButton("Stream OFF")
-        self.stream_off_button.clicked.connect(self._stream_off)
-
-        for button in (
-            self.prepare_button,
-            self.power_on_button,
-            self.power_off_button,
-            self.servo_on_button,
-            self.servo_off_button,
-            self.stream_on_button,
-            self.stream_off_button,
-        ):
-            button.setMinimumHeight(28)
-            layout.addWidget(button)
-
-        return group
+        # Re-polish so object-name based style updates immediately.
+        label.style().unpolish(label)
+        label.style().polish(label)
 
     def _build_current_command_group(self) -> QGroupBox:
         group = QGroupBox("Current Base Command")
@@ -363,19 +391,6 @@ class MainWindow(QMainWindow):
 
         return group
 
-    @staticmethod
-    def _build_safety_note_group() -> QGroupBox:
-        group = QGroupBox("Safety")
-        layout = QVBoxLayout(group)
-
-        note = QLabel(
-            "GUI MOTION STOP sends a stop command, but it does not replace "
-            "the robot's physical E-stop."
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
-
-        return group
 
     # ==================================================================
     # Base tab
@@ -422,10 +437,8 @@ class MainWindow(QMainWindow):
             self.ACTION_BACKWARD,
         )
 
-        center_stop = QPushButton("STOP")
-        center_stop.setObjectName("centerStop")
+        center_stop = self._motion_stop_button("MOTION STOP")
         center_stop.setMinimumHeight(40)
-        center_stop.clicked.connect(self.emergency_stop)
 
         motion_grid.addWidget(ccw, 0, 0)
         motion_grid.addWidget(forward, 0, 1)
@@ -547,6 +560,16 @@ class MainWindow(QMainWindow):
         self._action_buttons[action] = button
         return button
 
+    def _motion_stop_button(
+        self,
+        text: str = "MOTION STOP",
+    ) -> QPushButton:
+        button = QPushButton(text)
+        button.setObjectName("motionStop")
+        button.setMinimumHeight(36)
+        button.clicked.connect(self.motion_stop)
+        return button
+
     @staticmethod
     def _command_label() -> QLabel:
         label = QLabel("0.00")
@@ -577,7 +600,13 @@ class MainWindow(QMainWindow):
         group_layout.addWidget(label)
         group_layout.addStretch(1)
 
-        layout.addWidget(group)
+        layout.addWidget(group, 1)
+
+        stop_row = QHBoxLayout()
+        stop_row.addStretch(1)
+        stop_row.addWidget(self._motion_stop_button())
+        layout.addLayout(stop_row)
+
         return tab
 
     # ==================================================================
@@ -619,6 +648,7 @@ class MainWindow(QMainWindow):
         )
         self.move_target_button = QPushButton("MOVE TARGET")
         self.cancel_motion_button = QPushButton("CANCEL")
+        self.joint_motion_stop_button = self._motion_stop_button()
 
         self.copy_current_button.clicked.connect(
             self._copy_selected_current_to_target
@@ -633,6 +663,7 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(self.copy_current_button, 2)
         action_layout.addWidget(self.move_target_button, 2)
         action_layout.addWidget(self.cancel_motion_button, 1)
+        action_layout.addWidget(self.joint_motion_stop_button, 1)
 
         root.addWidget(action_group)
 
@@ -1097,11 +1128,10 @@ class MainWindow(QMainWindow):
 
                 self.joint_snapshot_values[index].setText("--")
 
-        if hasattr(self, "log_view"):
-            self.append_log(
-                "info",
-                f"Joint group selected: {label}.",
-            )
+        self.append_log(
+            "info",
+            f"Joint group selected: {label}.",
+        )
 
     def _on_joint_target_changed(
         self,
@@ -1228,11 +1258,10 @@ class MainWindow(QMainWindow):
             self.cartesian_target_spins[index].setValue(value)
             self.cartesian_target_spins[index].blockSignals(False)
 
-        if hasattr(self, "log_view"):
-            self.append_log(
-                "info",
-                f"Cartesian arm selected: {self.CARTESIAN_ARMS[arm]}.",
-            )
+        self.append_log(
+            "info",
+            f"Cartesian arm selected: {self.CARTESIAN_ARMS[arm]}.",
+        )
 
         if hasattr(self, "tcp_snapshot_values"):
             for label in self.tcp_snapshot_values:
@@ -1451,6 +1480,12 @@ class MainWindow(QMainWindow):
         group_layout.addWidget(self.diagnostic_summary)
 
         layout.addWidget(group, 1)
+
+        stop_row = QHBoxLayout()
+        stop_row.addStretch(1)
+        stop_row.addWidget(self._motion_stop_button())
+        layout.addLayout(stop_row)
+
         return tab
 
     def run_diagnostics(self) -> None:
@@ -1493,39 +1528,22 @@ class MainWindow(QMainWindow):
         )
 
     # ==================================================================
-    # Fixed bottom log
+    # Terminal-only UI logging
     # ==================================================================
-    def _build_log_panel(self) -> QGroupBox:
-        group = QGroupBox("Event Log")
-        layout = QVBoxLayout(group)
-        layout.setContentsMargins(6, 6, 6, 6)
-
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(700)
-        self.log_view.setMinimumHeight(46)
-        self.log_view.setMaximumHeight(62)
-
-        layout.addWidget(self.log_view)
-        return group
-
     def append_log(
         self,
         level: str,
         message: str,
     ) -> None:
         prefix = {
-            "error": "[ERROR] ",
-            "warning": "[WARN] ",
-        }.get(level, "")
+            "error": "[UI ERROR]",
+            "warning": "[UI WARN]",
+            "info": "[UI INFO]",
+        }.get(level, "[UI]")
 
-        self.log_view.appendPlainText(
-            prefix + message
-        )
-
-        scrollbar = self.log_view.verticalScrollBar()
-        scrollbar.setValue(
-            scrollbar.maximum()
+        print(
+            f"{prefix} {message}",
+            flush=True,
         )
 
     # ==================================================================
@@ -1547,7 +1565,7 @@ class MainWindow(QMainWindow):
 
     def _stream_off(self) -> None:
         # Stop first, then disable stream.
-        self.emergency_stop()
+        self.motion_stop()
         self.backend.request_stream(False)
 
     def _stop_base_only(self) -> None:
@@ -1565,7 +1583,9 @@ class MainWindow(QMainWindow):
             0.0,
         )
 
-    def emergency_stop(self) -> None:
+    def motion_stop(self) -> None:
+        """Software motion stop: base zero + active motion cancel."""
+
         # Stop mobile base first.
         self._stop_base_only()
 
@@ -1696,12 +1716,9 @@ class MainWindow(QMainWindow):
 
         self.state_value.setText(control_state_text)
 
-        self.stream_value.setText(
-            "ON"
-            if snapshot.stream_enabled is True
-            else "OFF"
-            if snapshot.stream_enabled is False
-            else "unknown"
+        self._set_status_indicator(
+            self.stream_value,
+            snapshot.stream_enabled,
         )
 
         self.emo_value.setText(
@@ -1747,7 +1764,6 @@ class MainWindow(QMainWindow):
             )
 
         service_widgets = (
-            self.prepare_button,
             self.power_on_button,
             self.power_off_button,
             self.servo_on_button,
@@ -1764,11 +1780,10 @@ class MainWindow(QMainWindow):
         # Day 2 motion state, when the backend provides it.
         self._refresh_motion_state()
 
-        for level, message in self.backend.drain_events():
-            self.append_log(
-                level,
-                message,
-            )
+        backend_events = self.backend.drain_events()
+        if self.backend_name != "ROS2":
+            for level, message in backend_events:
+                self.append_log(level, message)
 
     # ==================================================================
     # Keyboard / focus safety
@@ -1815,14 +1830,11 @@ class MainWindow(QMainWindow):
 
         key = event.key()
 
-        if key in (
-            qt_key("Key_Space"),
-            qt_key("Key_Escape"),
-        ):
+        if key == qt_key("Key_Space"):
             if event_kind == event_type(
                 "KeyPress"
             ):
-                self.emergency_stop()
+                self.motion_stop()
             return True
 
         action = self._action_for_key(key)
@@ -1938,14 +1950,26 @@ class MainWindow(QMainWindow):
                 background: #2a2f36;
             }
 
-            QPushButton#centerStop {
+            QPushButton#motionStop {
                 background: #7f4a24;
+                color: white;
+                font-size: 12px;
+                font-weight: 700;
             }
 
-            QPushButton#emergencyStop {
-                background: #9b2c2c;
-                font-size: 13px;
-                font-weight: 700;
+            QPushButton#eStopButton {
+                background: #b42323;
+                color: white;
+                border: 2px solid #ef5555;
+                border-radius: 8px;
+                font-size: 15px;
+                font-weight: 800;
+            }
+
+            QPushButton#eStopButton:disabled {
+                background: #5f3030;
+                color: #c7a0a0;
+                border: 2px solid #754343;
             }
 
             QDoubleSpinBox,
@@ -1977,15 +2001,23 @@ class MainWindow(QMainWindow):
                 background: #414b59;
             }
 
-            QLabel#backendBadge {
-                background: #171a1f;
-                border: 1px solid #657184;
-                border-radius: 4px;
-                padding: 4px 7px;
+
+            QLabel#stateValue {
                 font-weight: 700;
             }
 
-            QLabel#stateValue {
+            QLabel#statusOn {
+                color: #43c463;
+                font-weight: 700;
+            }
+
+            QLabel#statusOff {
+                color: #e05252;
+                font-weight: 700;
+            }
+
+            QLabel#statusUnknown {
+                color: #9ca3af;
                 font-weight: 700;
             }
 
