@@ -39,6 +39,7 @@ try:
         RobotState,
     )
     from rby1_msgs.srv import (
+        ControlManagerCommand,
         GetCartesianPose,
         StateOnOff,
     )
@@ -50,6 +51,7 @@ except ImportError:
     CartesianCommand = None  # type: ignore[assignment]
     JointCommand = None  # type: ignore[assignment]
     RobotState = None  # type: ignore[assignment]
+    ControlManagerCommand = None  # type: ignore[assignment]
     GetCartesianPose = None  # type: ignore[assignment]
     StateOnOff = None  # type: ignore[assignment]
     RBY1_MSGS_AVAILABLE = False
@@ -138,6 +140,10 @@ class Rby1ControlNode(Node):
             'stream_control_service',
             'stream_control',
         )
+        self.declare_parameter(
+            'control_manager_service',
+            'control_manager_command',
+        )
 
         # Manipulation interfaces exposed by rby1_driver.
         self.declare_parameter('joint_action', 'robot_joint')
@@ -221,6 +227,9 @@ class Rby1ControlNode(Node):
         )
         self.stream_control_service = str(
             self.get_parameter('stream_control_service').value
+        )
+        self.control_manager_service = str(
+            self.get_parameter('control_manager_service').value
         )
 
         self.joint_action_name = str(
@@ -422,6 +431,7 @@ class Rby1ControlNode(Node):
         self.power_client = None
         self.servo_client = None
         self.stream_client = None
+        self.control_manager_client = None
         self.state_sub = None
 
         self.joint_action_client = None
@@ -432,6 +442,7 @@ class Rby1ControlNode(Node):
 
         if self.services_enabled:
             assert StateOnOff is not None
+            assert ControlManagerCommand is not None
             assert RobotState is not None
             assert GetCartesianPose is not None
             assert Rby1JointCommand is not None
@@ -450,6 +461,11 @@ class Rby1ControlNode(Node):
             self.stream_client = self.create_client(
                 StateOnOff,
                 self.stream_control_service,
+            )
+
+            self.control_manager_client = self.create_client(
+                ControlManagerCommand,
+                self.control_manager_service,
             )
 
             self.state_sub = self.create_subscription(
@@ -1891,6 +1907,107 @@ class Rby1ControlNode(Node):
             label='Stream',
         )
 
+    def request_control_manager(
+        self,
+        command: str,
+    ) -> None:
+        """Send ENABLE, DISABLE, or RESET to the Control Manager."""
+
+        if (
+            not self.services_enabled
+            or self.control_manager_client is None
+            or ControlManagerCommand is None
+        ):
+            self._push_event(
+                'warning',
+                'Control Manager service is unavailable.',
+            )
+            return
+
+        if not self.control_manager_client.service_is_ready():
+            self._push_event(
+                'warning',
+                'Control Manager service not ready: '
+                f'{self.control_manager_service}',
+            )
+            return
+
+        command_key = str(command).strip().lower()
+        command_values = {
+            'enable': ControlManagerCommand.Request.CMD_ENABLE,
+            'disable': ControlManagerCommand.Request.CMD_DISABLE,
+            'reset': ControlManagerCommand.Request.CMD_RESET,
+        }
+
+        command_value = command_values.get(command_key)
+        if command_value is None:
+            self._push_event(
+                'error',
+                f'Unknown Control Manager command: {command}',
+            )
+            return
+
+        # Stop locally commanded base velocity before commands that can
+        # remove/reset control authority. The driver handles its own stream
+        # shutdown for DISABLE / RESET.
+        if command_key in ('disable', 'reset'):
+            self.stop(publish_immediately=True)
+
+        request = ControlManagerCommand.Request()
+        request.command = int(command_value)
+
+        future = self.control_manager_client.call_async(request)
+        self._pending_futures.append(future)
+        future.add_done_callback(
+            lambda done, requested=command_key:
+            self._control_manager_done(done, requested)
+        )
+
+        self._push_event(
+            'info',
+            f'Control Manager {command_key.upper()} requested.',
+        )
+
+    def _control_manager_done(
+        self,
+        future,
+        command: str,
+    ) -> None:
+        """Process a ControlManagerCommand service response."""
+
+        self._discard_future(future)
+
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._push_event(
+                'error',
+                'Control Manager '
+                f'{command.upper()} call failed: {exc}',
+            )
+            return
+
+        if result is not None and bool(result.success):
+            message = getattr(result, 'message', '')
+            suffix = f': {message}' if message else ''
+            self._push_event(
+                'info',
+                'Control Manager '
+                f'{command.upper()} succeeded{suffix}',
+            )
+            return
+
+        message = (
+            getattr(result, 'message', 'No response')
+            if result is not None
+            else 'No response'
+        )
+        self._push_event(
+            'error',
+            'Control Manager '
+            f'{command.upper()} failed: {message}',
+        )
+
     def _request_state_on_off(
         self,
         client,
@@ -2210,6 +2327,10 @@ class Rby1ControlNode(Node):
             'stream': bool(
                 self.stream_client
                 and self.stream_client.service_is_ready()
+            ),
+            'control_manager': bool(
+                self.control_manager_client
+                and self.control_manager_client.service_is_ready()
             ),
             'cartesian_pose': bool(
                 self.cartesian_pose_client
