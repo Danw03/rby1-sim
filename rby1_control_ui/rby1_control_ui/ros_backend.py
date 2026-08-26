@@ -26,6 +26,7 @@ from geometry_msgs.msg import Twist
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
 try:
@@ -113,6 +114,8 @@ class BackendSnapshot:
     cmd_vel_subscribers: int
 
     control_state: Optional[int]
+    power_enabled: Optional[bool]
+    servo_enabled: Optional[bool]
     stream_enabled: Optional[bool]
     emo_active: Optional[bool]
     collision_active: Optional[bool]
@@ -134,6 +137,12 @@ class Rby1ControlNode(Node):
         # ROS topic and service names.
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
         self.declare_parameter('robot_state_topic', 'robot_state')
+        self.declare_parameter('power_state_topic', 'power_state')
+        self.declare_parameter('servo_state_topic', 'servo_state')
+        self.declare_parameter(
+            'power_servo_feedback_timeout_sec',
+            1.5,
+        )
         self.declare_parameter('robot_power_service', 'robot_power')
         self.declare_parameter('robot_servo_service', 'robot_servo')
         self.declare_parameter(
@@ -218,6 +227,18 @@ class Rby1ControlNode(Node):
         )
         self.robot_state_topic = str(
             self.get_parameter('robot_state_topic').value
+        )
+        self.power_state_topic = str(
+            self.get_parameter('power_state_topic').value
+        )
+        self.servo_state_topic = str(
+            self.get_parameter('servo_state_topic').value
+        )
+        self.power_servo_feedback_timeout_sec = self._positive_float(
+            self.get_parameter(
+                'power_servo_feedback_timeout_sec'
+            ).value,
+            fallback=1.5,
         )
         self.robot_power_service = str(
             self.get_parameter('robot_power_service').value
@@ -351,9 +372,14 @@ class Rby1ControlNode(Node):
 
         # Actual robot state received from /robot_state.
         self.control_state: Optional[int] = None
+        self.power_enabled: Optional[bool] = None
+        self.servo_enabled: Optional[bool] = None
         self.stream_enabled: Optional[bool] = None
         self.emo_active: Optional[bool] = None
         self.collision_active: Optional[bool] = None
+
+        self._power_feedback_time: Optional[float] = None
+        self._servo_feedback_time: Optional[float] = None
 
         self._robot_state_received = False
 
@@ -412,6 +438,10 @@ class Rby1ControlNode(Node):
         self._active_motion_kind: Optional[str] = None
         self._active_goal_handle = None
 
+        # Action-level cancellation state for press-and-hold Cartesian jogging.
+        self._cancel_motion_on_accept = False
+        self._active_cancel_requested = False
+
         # Prepare Robot state machine.
         self._prepare_stage = 'idle'
         self._prepare_not_before = 0.0
@@ -424,6 +454,22 @@ class Rby1ControlNode(Node):
         self.cmd_vel_pub = self.create_publisher(
             Twist,
             self.cmd_vel_topic,
+            10,
+        )
+
+        # Read-only Power / Servo feedback from the companion SDK monitor.
+        # If the monitor disappears, snapshot() marks the values UNKNOWN
+        # after power_servo_feedback_timeout_sec.
+        self.power_state_sub = self.create_subscription(
+            Bool,
+            self.power_state_topic,
+            self._power_state_callback,
+            10,
+        )
+        self.servo_state_sub = self.create_subscription(
+            Bool,
+            self.servo_state_topic,
+            self._servo_state_callback,
             10,
         )
 
@@ -584,6 +630,40 @@ class Rby1ControlNode(Node):
             self._events.clear()
 
         return items
+
+    def _power_state_callback(self, msg: Bool) -> None:
+        """Receive actual power state from the read-only SDK monitor."""
+        value = bool(msg.data)
+        now = time.monotonic()
+
+        with self._lock:
+            changed = value != self.power_enabled
+            self.power_enabled = value
+            self._power_feedback_time = now
+
+        if changed:
+            self._push_event(
+                'info',
+                f'Power feedback changed to '
+                f'{"ON" if value else "OFF"}.',
+            )
+
+    def _servo_state_callback(self, msg: Bool) -> None:
+        """Receive actual servo state from the read-only SDK monitor."""
+        value = bool(msg.data)
+        now = time.monotonic()
+
+        with self._lock:
+            changed = value != self.servo_enabled
+            self.servo_enabled = value
+            self._servo_feedback_time = now
+
+        if changed:
+            self._push_event(
+                'info',
+                f'Servo feedback changed to '
+                f'{"ON" if value else "OFF"}.',
+            )
 
     def _state_callback(self, msg) -> None:
         """Receive the actual state published by the RB-Y1 driver."""
@@ -1554,6 +1634,9 @@ class Rby1ControlNode(Node):
     ) -> None:
         self._motion_busy = True
         self._active_motion_kind = label
+        self._active_goal_handle = None
+        self._cancel_motion_on_accept = False
+        self._active_cancel_requested = False
 
         future = client.send_goal_async(goal)
         self._pending_futures.append(future)
@@ -1584,6 +1667,8 @@ class Rby1ControlNode(Node):
             self._motion_busy = False
             self._active_motion_kind = None
             self._active_goal_handle = None
+            self._cancel_motion_on_accept = False
+            self._active_cancel_requested = False
 
             self._push_event(
                 'error',
@@ -1595,6 +1680,8 @@ class Rby1ControlNode(Node):
             self._motion_busy = False
             self._active_motion_kind = None
             self._active_goal_handle = None
+            self._cancel_motion_on_accept = False
+            self._active_cancel_requested = False
 
             self._push_event(
                 'error',
@@ -1608,6 +1695,11 @@ class Rby1ControlNode(Node):
             'info',
             f'{label} goal accepted.',
         )
+
+        # The direction key may have been released while send_goal_async()
+        # was still waiting for the server response.
+        if self._cancel_motion_on_accept:
+            self._request_active_goal_cancel(goal_handle)
 
         result_future = goal_handle.get_result_async()
         self._pending_futures.append(result_future)
@@ -1630,6 +1722,8 @@ class Rby1ControlNode(Node):
         self._motion_busy = False
         self._active_motion_kind = None
         self._active_goal_handle = None
+        self._cancel_motion_on_accept = False
+        self._active_cancel_requested = False
 
         try:
             wrapped_result = future.result()
@@ -1652,6 +1746,75 @@ class Rby1ControlNode(Node):
                 'warning',
                 f'{label} finished unsuccessfully: '
                 f'{result.finish_code}',
+            )
+
+    def is_motion_busy(self) -> bool:
+        """Return whether a Joint/Cartesian action is currently active."""
+        return bool(self._motion_busy)
+
+    def cancel_active_motion(self) -> None:
+        """Cancel only the current action goal, preserving stream state."""
+
+        if not self._motion_busy:
+            self._cancel_motion_on_accept = False
+            return
+
+        self._cancel_motion_on_accept = True
+
+        goal_handle = self._active_goal_handle
+        if goal_handle is None:
+            return
+
+        self._request_active_goal_cancel(goal_handle)
+
+    def _request_active_goal_cancel(self, goal_handle) -> None:
+        if self._active_cancel_requested:
+            return
+
+        self._active_cancel_requested = True
+
+        try:
+            future = goal_handle.cancel_goal_async()
+        except Exception as exc:
+            self._active_cancel_requested = False
+            self._push_event(
+                'warning',
+                f'Active motion cancel request failed: {exc}',
+            )
+            return
+
+        self._pending_futures.append(future)
+        future.add_done_callback(
+            self._active_motion_cancel_done
+        )
+
+    def _active_motion_cancel_done(self, future) -> None:
+        self._discard_future(future)
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            self._push_event(
+                'warning',
+                f'Active motion cancel failed: {exc}',
+            )
+            return
+
+        goals_canceling = getattr(
+            response,
+            'goals_canceling',
+            [],
+        )
+
+        if goals_canceling:
+            self._push_event(
+                'info',
+                'Active motion cancel accepted.',
+            )
+        else:
+            self._push_event(
+                'warning',
+                'Active motion cancel was not accepted.',
             )
 
     def cancel_motion(self) -> None:
@@ -2350,6 +2513,28 @@ class Rby1ControlNode(Node):
             ),
         }
 
+        now = time.monotonic()
+
+        with self._lock:
+            power_enabled = self.power_enabled
+            servo_enabled = self.servo_enabled
+            power_feedback_time = self._power_feedback_time
+            servo_feedback_time = self._servo_feedback_time
+
+        if (
+            power_feedback_time is None
+            or now - power_feedback_time
+            > self.power_servo_feedback_timeout_sec
+        ):
+            power_enabled = None
+
+        if (
+            servo_feedback_time is None
+            or now - servo_feedback_time
+            > self.power_servo_feedback_timeout_sec
+        ):
+            servo_enabled = None
+
         return BackendSnapshot(
             namespace=self.get_namespace(),
 
@@ -2360,6 +2545,8 @@ class Rby1ControlNode(Node):
             ),
 
             control_state=self.control_state,
+            power_enabled=power_enabled,
+            servo_enabled=servo_enabled,
             stream_enabled=self.stream_enabled,
             emo_active=self.emo_active,
             collision_active=self.collision_active,
