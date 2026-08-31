@@ -11,7 +11,13 @@ required=(
   launch/control_ui.launch.py
   rby1_control_ui/__init__.py
   rby1_control_ui/qt_compat.py
+  rby1_control_ui/backend_contract.py
   rby1_control_ui/ros_backend.py
+  rby1_control_ui/mock_backend.py
+  rby1_control_ui/task_commands.py
+  rby1_control_ui/task.py
+  rby1_control_ui/task_runner.py
+  rby1_control_ui/scenario_ui.py
   rby1_control_ui/main_window.py
   rby1_control_ui/main.py
 )

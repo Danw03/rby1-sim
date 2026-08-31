@@ -9,7 +9,7 @@ try:
         QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
         QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
         QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-        QSizePolicy, QSpacerItem, QTabWidget, QVBoxLayout, QWidget,
+        QListWidget, QSizePolicy, QSpacerItem, QTabWidget, QVBoxLayout, QWidget,
     )
     QT_BINDING = 'PySide6'
 except ImportError:
@@ -20,7 +20,7 @@ except ImportError:
             QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
             QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
             QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-            QSizePolicy, QSpacerItem, QTabWidget, QVBoxLayout, QWidget,
+            QListWidget, QSizePolicy, QSpacerItem, QTabWidget, QVBoxLayout, QWidget,
         )
         QT_BINDING = 'PyQt5'
     except ImportError as exc:

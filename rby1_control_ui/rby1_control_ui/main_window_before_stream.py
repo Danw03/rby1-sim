@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from typing import Dict, Set
 
-from .scenario_ui import ScenarioPanel
 from .qt_compat import (
     QAbstractSpinBox,
     QApplication,
@@ -90,7 +89,6 @@ class MainWindow(QMainWindow):
         self._pressed_actions: Set[str] = set()
         self._action_buttons: Dict[str, QPushButton] = {}
         self._closing = False
-        self._scenario_active = False
 
         self._joint_target_cache = {
             key: [0.0] * dof
@@ -1681,23 +1679,12 @@ class MainWindow(QMainWindow):
                     )
 
     def _build_scenario_tab(self) -> QWidget:
-        self.scenario_panel = ScenarioPanel(
-            self.backend,
-            on_log=self.append_log,
-            on_active_changed=self._scenario_active_changed,
-            on_emergency_stop=self.motion_stop,
+        return self._placeholder(
+            "Scenario Manager · next implementation",
+            "Scenario execution will use explicit steps such as "
+            "READY → BASE MOVE → STOP → JOINT POSE → RESULT, "
+            "with Cancel / Timeout / failure logging.",
         )
-        return self.scenario_panel
-
-    def _scenario_active_changed(self, active: bool) -> None:
-        self._scenario_active = bool(active)
-        if active:
-            self._stop_cartesian_hold(cancel_motion=False)
-            self._stop_base_only()
-
-        # Manual Base and Joint/Cartesian controls cannot race a Task.
-        self.tabs.setTabEnabled(0, not active)
-        self.tabs.setTabEnabled(1, not active)
 
     def _build_diagnostics_tab(self) -> QWidget:
         tab = QWidget()
@@ -1794,8 +1781,6 @@ class MainWindow(QMainWindow):
         self,
         action: str,
     ) -> None:
-        if self._scenario_active:
-            return
         self._pressed_actions.add(action)
         self._refresh_command()
 
@@ -1835,15 +1820,8 @@ class MainWindow(QMainWindow):
         # Stop mobile base first.
         self._stop_base_only()
 
-        scenario_was_active = (
-            hasattr(self, "scenario_panel")
-            and self.scenario_panel.runner.active
-        )
-        if scenario_was_active:
-            self.scenario_panel.emergency_stop()
-
-        # A running Scenario already requests cancellation through its runner.
-        if not scenario_was_active and hasattr(self.backend, "cancel_motion"):
+        # Cancel active joint / Cartesian motion.
+        if hasattr(self.backend, "cancel_motion"):
             self.backend.cancel_motion()
 
     def _refresh_command(self) -> None:
@@ -1851,8 +1829,6 @@ class MainWindow(QMainWindow):
             return
 
         vx, vy, wz = self._calculate_command()
-        if self._scenario_active:
-            vx = vy = wz = 0.0
         snapshot = self.backend.snapshot()
 
         if (
@@ -1972,14 +1948,6 @@ class MainWindow(QMainWindow):
         self.state_value.setText(control_state_text)
 
         self._set_status_indicator(
-            self.power_state_value,
-            snapshot.power_enabled,
-        )
-        self._set_status_indicator(
-            self.servo_state_value,
-            snapshot.servo_enabled,
-        )
-        self._set_status_indicator(
             self.stream_value,
             snapshot.stream_enabled,
         )
@@ -2018,7 +1986,6 @@ class MainWindow(QMainWindow):
                 ("cartesian_action", "TCP"),
                 ("cartesian_pose", "POSE"),
                 ("cancel_control", "CANCEL"),
-                ("scenario_safety", "SAFE"),
             )
             parts = [
                 f'{label}:{"ready" if ready.get(key) else "wait"}'
@@ -2177,9 +2144,6 @@ class MainWindow(QMainWindow):
         self._cartesian_hold_command = None
         self._pressed_actions.clear()
 
-        if hasattr(self, "scenario_panel"):
-            self.scenario_panel.runner.close()
-
         try:
             self.backend.shutdown_safely(
                 turn_stream_off=True
@@ -2268,24 +2232,11 @@ class MainWindow(QMainWindow):
 
             QDoubleSpinBox,
             QComboBox,
-            QListWidget,
             QPlainTextEdit {
                 background: #171a1f;
                 border: 1px solid #4b5563;
                 border-radius: 4px;
                 padding: 3px;
-            }
-
-            QListWidget::item:selected {
-                background: #2c6e9b;
-                color: #ffffff;
-            }
-
-            QPushButton#emergencyStop {
-                background: #9b2c2c;
-                color: white;
-                font-size: 13px;
-                font-weight: 700;
             }
 
             QFrame#headerFrame {
