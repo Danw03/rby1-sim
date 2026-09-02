@@ -5,7 +5,7 @@ package_name = 'rby1_control_ui'
 
 setup(
     name=package_name,
-    version='0.1.0',
+    version='0.2.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
@@ -17,7 +17,7 @@ setup(
     zip_safe=True,
     maintainer='RB-Y1 UI Developer',
     maintainer_email='user@example.com',
-    description='Reusable Qt teleoperation UI for the RB-Y1 mobile base.',
+    description='Qt teleoperation and IDE-authored Task UI for RB-Y1.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={

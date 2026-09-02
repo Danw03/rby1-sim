@@ -16,7 +16,6 @@ Supported paths:
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
 import math
 import threading
 import time
@@ -26,7 +25,17 @@ from geometry_msgs.msg import Twist
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
+
+from .backend_contract import (
+    BackendSnapshot,
+    TaskBackendState,
+    TaskCommandState,
+    TaskCommandStatus,
+    VelocityCommand,
+)
+from .task_commands import CommandKind, TaskCommand
 
 try:
     from rby1_msgs.action import (
@@ -39,6 +48,7 @@ try:
         RobotState,
     )
     from rby1_msgs.srv import (
+        ControlManagerCommand,
         GetCartesianPose,
         StateOnOff,
     )
@@ -50,6 +60,7 @@ except ImportError:
     CartesianCommand = None  # type: ignore[assignment]
     JointCommand = None  # type: ignore[assignment]
     RobotState = None  # type: ignore[assignment]
+    ControlManagerCommand = None  # type: ignore[assignment]
     GetCartesianPose = None  # type: ignore[assignment]
     StateOnOff = None  # type: ignore[assignment]
     RBY1_MSGS_AVAILABLE = False
@@ -89,38 +100,37 @@ JOINT_LIMITS_RAD = {
     ),
 }
 
-@dataclass(frozen=True)
-class VelocityCommand:
-    vx: float = 0.0
-    vy: float = 0.0
-    wz: float = 0.0
+JOINT_MAX_VELOCITY_RAD = {
+    'torso': (2.09439510, 2.09439510, 2.09439510, math.pi, math.pi, math.pi),
+    'right_arm': (
+        math.pi, math.pi, math.pi, math.pi,
+        2 * math.pi, 2 * math.pi, 2.094395102,
+    ),
+    'left_arm': (
+        math.pi, math.pi, math.pi, math.pi,
+        2 * math.pi, 2 * math.pi, 2.094395102,
+    ),
+    'head': (3.14, 3.14),
+}
+JOINT_MAX_ACCELERATION_RAD = {
+    'torso': (5.0,) * 6,
+    'right_arm': (10.0,) * 7,
+    'left_arm': (10.0,) * 7,
+    # The model does not provide verified head acceleration limits.
+    'head': (None, None),
+}
 
-    @property
-    def stopped(self) -> bool:
-        return (
-            abs(self.vx) < 1e-9
-            and abs(self.vy) < 1e-9
-            and abs(self.wz) < 1e-9
-        )
+DRIVER_SAFETY_CONTRACT = (
+    'rby1_scenario_safety_v2;'
+    'joint_path=sampled_0.05rad;'
+    'cartesian_execution=sdk_builder;'
+    'cartesian_strict_path=optional_ik_0.005m_0.087rad;'
+    'runtime_collision_cancel=true;'
+    'runtime_joint_limit_cancel=true'
+)
 
-
-@dataclass(frozen=True)
-class BackendSnapshot:
-    namespace: str
-    cmd_vel_topic: str
-    cmd_vel_subscribers: int
-
-    control_state: Optional[int]
-    stream_enabled: Optional[bool]
-    emo_active: Optional[bool]
-    collision_active: Optional[bool]
-
-    services_enabled: bool
-    rby1_msgs_available: bool
-    service_ready: Dict[str, bool]
-
-    command: VelocityCommand
-    command_stale: bool
+TASK_CARTESIAN_STOP_POSITION_ERROR_M = 5e-3
+TASK_CARTESIAN_STOP_ORIENTATION_ERROR_RAD = 1e-2
 
 
 class Rby1ControlNode(Node):
@@ -132,11 +142,21 @@ class Rby1ControlNode(Node):
         # ROS topic and service names.
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
         self.declare_parameter('robot_state_topic', 'robot_state')
+        self.declare_parameter('power_state_topic', 'power_state')
+        self.declare_parameter('servo_state_topic', 'servo_state')
+        self.declare_parameter(
+            'power_servo_feedback_timeout_sec',
+            1.5,
+        )
         self.declare_parameter('robot_power_service', 'robot_power')
         self.declare_parameter('robot_servo_service', 'robot_servo')
         self.declare_parameter(
             'stream_control_service',
             'stream_control',
+        )
+        self.declare_parameter(
+            'control_manager_service',
+            'control_manager_command',
         )
 
         # Manipulation interfaces exposed by rby1_driver.
@@ -152,6 +172,10 @@ class Rby1ControlNode(Node):
         self.declare_parameter(
             'cancel_control_service',
             'cancel_control',
+        )
+        self.declare_parameter(
+            'scenario_safety_capabilities_service',
+            'scenario_safety_capabilities',
         )
 
         self.declare_parameter(
@@ -206,12 +230,40 @@ class Rby1ControlNode(Node):
             'cartesian_jog_minimum_time_sec',
             1.0,
         )
+        # Conservative limits for manual MOVE TARGET and jog commands.
+        # Scenario commands keep their explicit values from task.py.
+        self.declare_parameter('manual_joint_velocity_limit', 0.2)
+        self.declare_parameter('manual_joint_acceleration_limit', 0.2)
+        self.declare_parameter(
+            'manual_cartesian_linear_velocity_limit',
+            0.05,
+        )
+        self.declare_parameter(
+            'manual_cartesian_angular_velocity_limit',
+            0.2,
+        )
+        self.declare_parameter(
+            'manual_cartesian_acceleration_scaling',
+            0.2,
+        )
 
         self.cmd_vel_topic = str(
             self.get_parameter('cmd_vel_topic').value
         )
         self.robot_state_topic = str(
             self.get_parameter('robot_state_topic').value
+        )
+        self.power_state_topic = str(
+            self.get_parameter('power_state_topic').value
+        )
+        self.servo_state_topic = str(
+            self.get_parameter('servo_state_topic').value
+        )
+        self.power_servo_feedback_timeout_sec = self._positive_float(
+            self.get_parameter(
+                'power_servo_feedback_timeout_sec'
+            ).value,
+            fallback=1.5,
         )
         self.robot_power_service = str(
             self.get_parameter('robot_power_service').value
@@ -221,6 +273,9 @@ class Rby1ControlNode(Node):
         )
         self.stream_control_service = str(
             self.get_parameter('stream_control_service').value
+        )
+        self.control_manager_service = str(
+            self.get_parameter('control_manager_service').value
         )
 
         self.joint_action_name = str(
@@ -234,6 +289,11 @@ class Rby1ControlNode(Node):
         )
         self.cancel_control_service = str(
             self.get_parameter('cancel_control_service').value
+        )
+        self.scenario_safety_capabilities_service = str(
+            self.get_parameter(
+                'scenario_safety_capabilities_service'
+            ).value
         )
 
         self.joint_state_topics = {
@@ -329,6 +389,36 @@ class Rby1ControlNode(Node):
             fallback=1.0,
         )
 
+        self.manual_joint_velocity_limit = self._positive_float(
+            self.get_parameter('manual_joint_velocity_limit').value,
+            fallback=0.2,
+        )
+        self.manual_joint_acceleration_limit = self._positive_float(
+            self.get_parameter('manual_joint_acceleration_limit').value,
+            fallback=0.2,
+        )
+        self.manual_cartesian_linear_velocity_limit = self._positive_float(
+            self.get_parameter(
+                'manual_cartesian_linear_velocity_limit'
+            ).value,
+            fallback=0.05,
+        )
+        self.manual_cartesian_angular_velocity_limit = self._positive_float(
+            self.get_parameter(
+                'manual_cartesian_angular_velocity_limit'
+            ).value,
+            fallback=0.2,
+        )
+        acceleration_scaling = self._positive_float(
+            self.get_parameter(
+                'manual_cartesian_acceleration_scaling'
+            ).value,
+            fallback=0.2,
+        )
+        self.manual_cartesian_acceleration_scaling = (
+            acceleration_scaling if acceleration_scaling <= 1.0 else 0.2
+        )
+
         # Shared command state.
         self._lock = threading.RLock()
 
@@ -342,11 +432,17 @@ class Rby1ControlNode(Node):
 
         # Actual robot state received from /robot_state.
         self.control_state: Optional[int] = None
+        self.power_enabled: Optional[bool] = None
+        self.servo_enabled: Optional[bool] = None
         self.stream_enabled: Optional[bool] = None
         self.emo_active: Optional[bool] = None
         self.collision_active: Optional[bool] = None
 
+        self._power_feedback_time: Optional[float] = None
+        self._servo_feedback_time: Optional[float] = None
+
         self._robot_state_received = False
+        self._robot_state_updated_at: Optional[float] = None
 
         # Manipulator state returned to the Qt GUI.
         self._joint_groups_deg: Dict[
@@ -366,6 +462,41 @@ class Rby1ControlNode(Node):
             'right_arm': None,
             'left_arm': None,
         }
+        self._joint_updated_at = {
+            group: None for group in self._joint_groups_deg
+        }
+        self._joint_order_verified = {
+            group: False for group in self._joint_groups_deg
+        }
+        self._cartesian_updated_at = {
+            arm: None for arm in self._cartesian_state
+        }
+
+        # Keep the measured orientation in quaternion form for Cartesian
+        # angular jogs. RPY is retained separately only for UI display.
+        # Converting quaternion -> RPY -> quaternion for every jog makes the
+        # jog axes depend on the Euler-angle sequence and becomes singular at
+        # pitch +/- 90 degrees.
+        self._cartesian_quaternion_state: Dict[
+            str,
+            Optional[Tuple[float, float, float, float]],
+        ] = {
+            'right_arm': None,
+            'left_arm': None,
+        }
+
+        self._cartesian_snapshot: Dict[
+            str,
+            Optional[List[float]],
+        ] = {
+            'right_arm': None,
+            'left_arm': None,
+        }
+
+        self._cartesian_snapshot_pending = {
+            'right_arm': False,
+            'left_arm': False,
+        }
 
         self._cartesian_request_pending = {
             'right_arm': False,
@@ -376,6 +507,16 @@ class Rby1ControlNode(Node):
         self._motion_busy = False
         self._active_motion_kind: Optional[str] = None
         self._active_goal_handle = None
+        self._active_task_command_id: Optional[str] = None
+        self._task_command_sequence = 0
+        self._task_commands: Dict[str, TaskCommandState] = {}
+        self._driver_safety_verified = False
+        self._driver_safety_updated_at: Optional[float] = None
+        self._driver_safety_request_pending = False
+
+        # Action-level cancellation state for press-and-hold Cartesian jogging.
+        self._cancel_motion_on_accept = False
+        self._active_cancel_requested = False
 
         # Prepare Robot state machine.
         self._prepare_stage = 'idle'
@@ -392,20 +533,39 @@ class Rby1ControlNode(Node):
             10,
         )
 
+        # Read-only Power / Servo feedback from the companion SDK monitor.
+        # If the monitor disappears, snapshot() marks the values UNKNOWN
+        # after power_servo_feedback_timeout_sec.
+        self.power_state_sub = self.create_subscription(
+            Bool,
+            self.power_state_topic,
+            self._power_state_callback,
+            10,
+        )
+        self.servo_state_sub = self.create_subscription(
+            Bool,
+            self.servo_state_topic,
+            self._servo_state_callback,
+            10,
+        )
+
         # RB-Y1 service clients and subscriber.
         self.power_client = None
         self.servo_client = None
         self.stream_client = None
+        self.control_manager_client = None
         self.state_sub = None
 
         self.joint_action_client = None
         self.cartesian_action_client = None
         self.cartesian_pose_client = None
         self.cancel_control_client = None
+        self.scenario_safety_capabilities_client = None
         self.joint_state_subs = []
 
         if self.services_enabled:
             assert StateOnOff is not None
+            assert ControlManagerCommand is not None
             assert RobotState is not None
             assert GetCartesianPose is not None
             assert Rby1JointCommand is not None
@@ -426,6 +586,11 @@ class Rby1ControlNode(Node):
                 self.stream_control_service,
             )
 
+            self.control_manager_client = self.create_client(
+                ControlManagerCommand,
+                self.control_manager_service,
+            )
+
             self.state_sub = self.create_subscription(
                 RobotState,
                 self.robot_state_topic,
@@ -441,6 +606,10 @@ class Rby1ControlNode(Node):
             self.cancel_control_client = self.create_client(
                 Trigger,
                 self.cancel_control_service,
+            )
+            self.scenario_safety_capabilities_client = self.create_client(
+                Trigger,
+                self.scenario_safety_capabilities_service,
             )
 
             self.joint_action_client = ActionClient(
@@ -491,6 +660,10 @@ class Rby1ControlNode(Node):
         self.cartesian_state_timer = self.create_timer(
             self.cartesian_state_period_sec,
             self._poll_cartesian_state,
+        )
+        self.driver_safety_timer = self.create_timer(
+            1.0,
+            self._poll_driver_safety_capabilities,
         )
 
         self._push_event(
@@ -543,10 +716,45 @@ class Rby1ControlNode(Node):
 
         return items
 
+    def _power_state_callback(self, msg: Bool) -> None:
+        """Receive actual power state from the read-only SDK monitor."""
+        value = bool(msg.data)
+        now = time.monotonic()
+
+        with self._lock:
+            changed = value != self.power_enabled
+            self.power_enabled = value
+            self._power_feedback_time = now
+
+        if changed:
+            self._push_event(
+                'info',
+                f'Power feedback changed to '
+                f'{"ON" if value else "OFF"}.',
+            )
+
+    def _servo_state_callback(self, msg: Bool) -> None:
+        """Receive actual servo state from the read-only SDK monitor."""
+        value = bool(msg.data)
+        now = time.monotonic()
+
+        with self._lock:
+            changed = value != self.servo_enabled
+            self.servo_enabled = value
+            self._servo_feedback_time = now
+
+        if changed:
+            self._push_event(
+                'info',
+                f'Servo feedback changed to '
+                f'{"ON" if value else "OFF"}.',
+            )
+
     def _state_callback(self, msg) -> None:
         """Receive the actual state published by the RB-Y1 driver."""
 
         self._robot_state_received = True
+        self._robot_state_updated_at = time.monotonic()
 
         new_control_state = int(msg.control_manager_state)
         new_stream_enabled = bool(msg.robot_stream_state)
@@ -635,6 +843,7 @@ class Rby1ControlNode(Node):
             )
         }
 
+        ordered_by_name = True
         try:
             ordered_rad = [
                 position_by_name[name]
@@ -645,6 +854,7 @@ class Rby1ControlNode(Node):
             # are unavailable.
             if len(msg.position) < len(names):
                 return
+            ordered_by_name = False
             ordered_rad = [
                 float(value)
                 for value in msg.position[:len(names)]
@@ -657,6 +867,8 @@ class Rby1ControlNode(Node):
 
         with self._lock:
             self._joint_groups_deg[group] = ordered_deg
+            self._joint_updated_at[group] = time.monotonic()
+            self._joint_order_verified[group] = ordered_by_name
 
     def _poll_cartesian_state(self) -> None:
         """Request current right/left end-effector poses asynchronously."""
@@ -696,6 +908,29 @@ class Rby1ControlNode(Node):
                 )
             )
 
+    def _transform_to_pose(self, transform) -> List[float]:
+        quaternion = self._normalize_quaternion(
+            float(transform.rotation.x),
+            float(transform.rotation.y),
+            float(transform.rotation.z),
+            float(transform.rotation.w),
+        )
+
+        roll_deg, pitch_deg, yaw_deg = (
+            self._quaternion_to_rpy_deg(
+                *quaternion,
+            )
+        )
+
+        return [
+            float(transform.translation.x),
+            float(transform.translation.y),
+            float(transform.translation.z),
+            roll_deg,
+            pitch_deg,
+            yaw_deg,
+        ]
+    
     def _cartesian_pose_done(
         self,
         future,
@@ -717,28 +952,127 @@ class Rby1ControlNode(Node):
         if response is None:
             return
 
-        transform = response.transform
-
-        roll_deg, pitch_deg, yaw_deg = (
-            self._quaternion_to_rpy_deg(
-                float(transform.rotation.x),
-                float(transform.rotation.y),
-                float(transform.rotation.z),
-                float(transform.rotation.w),
+        try:
+            pose = self._transform_to_pose(response.transform)
+            quaternion = self._normalize_quaternion(
+                float(response.transform.rotation.x),
+                float(response.transform.rotation.y),
+                float(response.transform.rotation.z),
+                float(response.transform.rotation.w),
             )
-        )
-
-        pose = [
-            float(transform.translation.x),
-            float(transform.translation.y),
-            float(transform.translation.z),
-            roll_deg,
-            pitch_deg,
-            yaw_deg,
-        ]
+        except ValueError as exc:
+            self._push_event(
+                'warning',
+                f'Invalid Cartesian pose for {arm}: {exc}',
+            )
+            return
 
         with self._lock:
             self._cartesian_state[arm] = pose
+            self._cartesian_quaternion_state[arm] = quaternion
+            self._cartesian_updated_at[arm] = time.monotonic()
+
+    def _poll_driver_safety_capabilities(self) -> None:
+        client = self.scenario_safety_capabilities_client
+        if (
+            not self.services_enabled
+            or client is None
+            or not client.service_is_ready()
+        ):
+            with self._lock:
+                self._driver_safety_verified = False
+                self._driver_safety_updated_at = None
+            return
+
+        with self._lock:
+            if self._driver_safety_request_pending:
+                return
+            self._driver_safety_request_pending = True
+
+        try:
+            future = client.call_async(Trigger.Request())
+        except Exception as exc:
+            with self._lock:
+                self._driver_safety_request_pending = False
+                self._driver_safety_verified = False
+                self._driver_safety_updated_at = None
+            self._push_event(
+                'warning',
+                f'Driver safety request failed: {exc}',
+            )
+            return
+
+        self._pending_futures.append(future)
+        future.add_done_callback(
+            self._driver_safety_capabilities_done
+        )
+
+    def _driver_safety_capabilities_done(self, future) -> None:
+        self._discard_future(future)
+        with self._lock:
+            self._driver_safety_request_pending = False
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            with self._lock:
+                self._driver_safety_verified = False
+                self._driver_safety_updated_at = None
+            self._push_event(
+                'warning',
+                f'Driver safety proof failed: {exc}',
+            )
+            return
+
+        verified = bool(
+            response is not None
+            and response.success is True
+            and response.message == DRIVER_SAFETY_CONTRACT
+        )
+        with self._lock:
+            recovered = verified and not self._driver_safety_verified
+            self._driver_safety_verified = verified
+            self._driver_safety_updated_at = (
+                time.monotonic() if verified else None
+            )
+
+        if recovered:
+            self._push_event(
+                'info',
+                'Driver Scenario safety contract verified.',
+            )
+
+    def _cartesian_snapshot_done(
+        self,
+        future,
+        arm: str,
+        ) -> None:
+        self._discard_future(future)
+        self._cartesian_snapshot_pending[arm] = False
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            self._push_event(
+                'warning',
+                f'Get TCP failed for {arm}: {exc}',
+            )
+            return
+
+        if response is None:
+            return
+
+        try:
+            pose = self._transform_to_pose(response.transform)
+        except ValueError as exc:
+            self._push_event(
+                'warning',
+                f'Invalid TCP snapshot for {arm}: {exc}',
+            )
+            return
+
+        with self._lock:
+            self._cartesian_snapshot[arm] = pose   
 
     @staticmethod
     def _quaternion_to_rpy_deg(
@@ -793,6 +1127,63 @@ class Rby1ControlNode(Node):
 
         return x, y, z, w
 
+    @staticmethod
+    def _normalize_quaternion(
+        x: float,
+        y: float,
+        z: float,
+        w: float,
+    ) -> Tuple[float, float, float, float]:
+        """Return a unit quaternion in x/y/z/w order."""
+
+        values = (float(x), float(y), float(z), float(w))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError('quaternion contains a non-finite value')
+
+        norm = math.sqrt(sum(value * value for value in values))
+        if norm < 1.0e-12:
+            raise ValueError('quaternion has zero length')
+
+        return tuple(value / norm for value in values)
+
+    @staticmethod
+    def _multiply_quaternions(
+        left: Tuple[float, float, float, float],
+        right: Tuple[float, float, float, float],
+    ) -> Tuple[float, float, float, float]:
+        """Hamilton product of x/y/z/w quaternions: left * right."""
+
+        lx, ly, lz, lw = left
+        rx, ry, rz, rw = right
+
+        return (
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        )
+
+    @staticmethod
+    def _axis_angle_deg_to_quaternion(
+        axis_index: int,
+        angle_deg: float,
+    ) -> Tuple[float, float, float, float]:
+        """Create a quaternion for X/Y/Z axis_index and angle in degrees."""
+
+        if axis_index < 0 or axis_index >= 3:
+            raise ValueError(f'invalid rotation axis {axis_index}')
+
+        half_angle = math.radians(float(angle_deg)) * 0.5
+        vector = [0.0, 0.0, 0.0]
+        vector[axis_index] = math.sin(half_angle)
+
+        return (
+            vector[0],
+            vector[1],
+            vector[2],
+            math.cos(half_angle),
+        )
+
     def get_motion_state(self) -> Dict[str, object]:
         """Return cached joint and Cartesian state for the Qt GUI."""
 
@@ -821,6 +1212,81 @@ class Rby1ControlNode(Node):
             'joint_groups': joint_groups,
             'cartesian': cartesian,
         }
+
+    def request_cartesian_snapshot(self, arm: str) -> bool:
+        """Request a fresh Cartesian pose snapshot."""
+
+        if arm not in self.cartesian_links:
+            return False
+
+        if (
+            not self.services_enabled
+            or self.cartesian_pose_client is None
+            or GetCartesianPose is None
+        ):
+            return False
+
+        if not self.cartesian_pose_client.service_is_ready():
+            self._push_event(
+                'warning',
+                'GetCartesianPose service is not ready.',
+            )
+            return False
+
+        if self._cartesian_snapshot_pending[arm]:
+            return False
+
+        ref_link, target_link = self.cartesian_links[arm]
+
+        request = GetCartesianPose.Request()
+        request.ref_link = ref_link
+        request.target_link = target_link
+
+        # 이전 snapshot을 지운다.
+        with self._lock:
+            self._cartesian_snapshot[arm] = None
+
+        future = self.cartesian_pose_client.call_async(request)
+
+        self._cartesian_snapshot_pending[arm] = True
+        self._pending_futures.append(future)
+
+        future.add_done_callback(
+            lambda done, arm_name=arm:
+            self._cartesian_snapshot_done(
+                done,
+                arm_name,
+            )
+        )
+
+        return True
+    
+    def get_cartesian_snapshot(
+        self,
+        arm: str,
+    ) -> Optional[List[float]]:
+
+        with self._lock:
+            values = self._cartesian_snapshot.get(arm)
+
+            if values is None:
+                return None
+
+            return list(values)
+        
+    def get_joint_snapshot(
+        self,
+        group: str,
+        ) -> Optional[List[float]]:
+        """Return a copy of the latest joint state in degrees."""
+
+        with self._lock:
+            values = self._joint_groups_deg.get(group)
+
+            if values is None:
+                return None
+
+        return list(values)
 
     def _motion_command_allowed(self) -> bool:
         """Common safety gate before sending a manipulation goal."""
@@ -1035,6 +1501,10 @@ class Rby1ControlNode(Node):
             0.1,
             float(minimum_time),
         )
+        command.velocity_limit = self.manual_joint_velocity_limit
+        command.acceleration_limit = self.manual_joint_acceleration_limit
+        command.use_impedance = False
+        command.use_group_joint = False
 
         goal = Rby1JointCommand.Goal()
         setattr(goal, group, command)
@@ -1052,17 +1522,39 @@ class Rby1ControlNode(Node):
         delta: float,
         reference_frame: str = 'base',
     ) -> None:
-        """Jog one Cartesian component from the latest absolute pose."""
+        """Jog one Cartesian component from the latest measured pose.
 
-        del reference_frame
+        Linear jogs add to translation in the configured reference frame.
+        Angular jogs compose a delta quaternion on the left, so Roll/Pitch/Yaw
+        consistently mean rotations about the reference-frame X/Y/Z axes.
+        """
 
         with self._lock:
             current = self._cartesian_state.get(arm)
+            current_quaternion = (
+                self._cartesian_quaternion_state.get(arm)
+                if hasattr(self, '_cartesian_quaternion_state')
+                else None
+            )
+
+            snapshot = (
+                self._cartesian_snapshot.get(arm)
+                if hasattr(self, "_cartesian_snapshot")
+                else None
+            )
+
             target = (
                 list(current)
                 if current is not None
                 else None
             )
+
+        self._push_event(
+            "info",
+            f"[CS SOURCE] {arm} "
+            f"live={current}, "
+            f"snapshot={snapshot}",
+        )
 
         if target is None:
             self._push_event(
@@ -1080,13 +1572,56 @@ class Rby1ControlNode(Node):
             )
             return
 
-        target[axis_index] += float(delta)
+        #---Log A: log the current and target pose---
+        current_pose = list(target)
 
-        self.move_cartesian(
+        if current_quaternion is None:
+            self._push_event(
+                'warning',
+                f'Cartesian jog rejected: '
+                f'no current quaternion for {arm}.',
+            )
+            return
+
+        translation = list(current_pose[:3])
+
+        if axis_index < 3:
+            translation[axis_index] += float(delta)
+            target_quaternion = current_quaternion
+        else:
+            delta_quaternion = self._axis_angle_deg_to_quaternion(
+                axis_index - 3,
+                float(delta),
+            )
+
+            # Left multiplication applies the delta around an axis of the
+            # reference frame (Base in the current UI).
+            composed = self._multiply_quaternions(
+                delta_quaternion,
+                current_quaternion,
+            )
+            target_quaternion = self._normalize_quaternion(*composed)
+
+        target_rpy = self._quaternion_to_rpy_deg(*target_quaternion)
+        target = translation + list(target_rpy)
+
+        axis_names = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
+
+        self._push_event(
+            "info",
+            f"[CS JOG] {arm} "
+            f"axis={axis_names[axis_index]}, "
+            f"current={['%.3f' % v for v in current_pose]}, "
+            f"target={['%.3f' % v for v in target]}",
+        )
+
+        self._move_cartesian_quaternion(
             arm,
-            target,
+            translation,
+            target_quaternion,
             self.cartesian_jog_minimum_time_sec,
             reference_frame='base',
+            log_rpy=target_rpy,
         )
 
     def move_cartesian(
@@ -1121,6 +1656,65 @@ class Rby1ControlNode(Node):
             self._push_event(
                 'error',
                 'Non-finite Cartesian target rejected.',
+            )
+            return
+
+        quaternion = self._rpy_deg_to_quaternion(
+            values[3],
+            values[4],
+            values[5],
+        )
+
+        self._move_cartesian_quaternion(
+            arm,
+            values[:3],
+            quaternion,
+            minimum_time,
+            reference_frame=reference_frame,
+            log_rpy=(values[3], values[4], values[5]),
+        )
+
+    def _move_cartesian_quaternion(
+        self,
+        arm: str,
+        translation: List[float],
+        quaternion: Tuple[float, float, float, float],
+        minimum_time: float,
+        reference_frame: str = 'base',
+        log_rpy: Optional[Tuple[float, float, float]] = None,
+    ) -> None:
+        """Send an absolute Cartesian target using a quaternion directly."""
+
+        if arm not in ('right_arm', 'left_arm'):
+            self._push_event(
+                'error',
+                f'Unknown Cartesian arm: {arm}.',
+            )
+            return
+
+        if len(translation) != 3 or len(quaternion) != 4:
+            self._push_event(
+                'error',
+                'Cartesian quaternion target must contain 3 translation '
+                'and 4 rotation values.',
+            )
+            return
+
+        position = [float(value) for value in translation]
+
+        if not all(math.isfinite(value) for value in position):
+            self._push_event(
+                'error',
+                'Non-finite Cartesian translation rejected.',
+            )
+            return
+
+        try:
+            qx, qy, qz, qw = self._normalize_quaternion(*quaternion)
+        except ValueError as exc:
+            self._push_event(
+                'error',
+                f'Invalid Cartesian quaternion rejected: {exc}.',
             )
             return
 
@@ -1161,16 +1755,23 @@ class Rby1ControlNode(Node):
         command.ref_link = ref_link
         command.target_link = target_link
 
-        command.transform.translation.x = values[0]
-        command.transform.translation.y = values[1]
-        command.transform.translation.z = values[2]
+        command.transform.translation.x = position[0]
+        command.transform.translation.y = position[1]
+        command.transform.translation.z = position[2]
 
-        qx, qy, qz, qw = self._rpy_deg_to_quaternion(
-            values[3],
-            values[4],
-            values[5],
+        if log_rpy is None:
+            log_rpy = self._quaternion_to_rpy_deg(qx, qy, qz, qw)
+
+        #---Log B: log the target pose in RPY and quaternion---#
+        self._push_event(
+            "info",
+            f"[CS QUAT] {arm} "
+            f"RPY=({log_rpy[0]:+.3f}, "
+            f"{log_rpy[1]:+.3f}, "
+            f"{log_rpy[2]:+.3f}) deg, "
+            f"Q=({qx:+.6f}, {qy:+.6f}, "
+            f"{qz:+.6f}, {qw:+.6f})",
         )
-
         command.transform.rotation.x = qx
         command.transform.rotation.y = qy
         command.transform.rotation.z = qz
@@ -1180,6 +1781,16 @@ class Rby1ControlNode(Node):
             0.1,
             float(minimum_time),
         )
+        command.linear_velocity_limit = (
+            self.manual_cartesian_linear_velocity_limit
+        )
+        command.angular_velocity_limit = (
+            self.manual_cartesian_angular_velocity_limit
+        )
+        command.acceleration_limit_scaling = (
+            self.manual_cartesian_acceleration_scaling
+        )
+        command.use_impedance = False
 
         goal = Rby1CartesianCommand.Goal()
         setattr(goal, arm, command)
@@ -1190,23 +1801,233 @@ class Rby1ControlNode(Node):
             label=f'Cartesian {arm}',
         )
 
+    # ==================================================================
+    # Asynchronous Scenario Task contract
+    # ==================================================================
+    def task_state(self) -> TaskBackendState:
+        now = time.monotonic()
+        with self._lock:
+            return TaskBackendState(
+                captured_at=now,
+                robot_state_updated_at=self._robot_state_updated_at,
+                control_state=self.control_state,
+                emo_active=self.emo_active,
+                collision_active=self.collision_active,
+                motion_active=bool(self._motion_busy),
+                joint_groups={
+                    group: tuple(values) if values is not None else None
+                    for group, values in self._joint_groups_deg.items()
+                },
+                joint_updated_at=dict(self._joint_updated_at),
+                joint_order_verified=dict(self._joint_order_verified),
+                cartesian={
+                    arm: tuple(values) if values is not None else None
+                    for arm, values in self._cartesian_state.items()
+                },
+                cartesian_updated_at=dict(self._cartesian_updated_at),
+                driver_safety_verified=self._driver_safety_verified,
+                driver_safety_updated_at=self._driver_safety_updated_at,
+            )
+
+    def start_task_command(self, command: TaskCommand) -> str:
+        """Validate and send one already-resolved absolute Task command."""
+
+        if not isinstance(command, TaskCommand):
+            raise TypeError('command must be a TaskCommand')
+        if command.kind not in (
+            CommandKind.JOINT_ABSOLUTE,
+            CommandKind.JOINT_ABSOLUTE_MULTI,
+            CommandKind.LINEAR_ABSOLUTE,
+        ):
+            raise ValueError('backend accepts only resolved absolute commands')
+        if not self._motion_command_allowed():
+            raise RuntimeError('robot rejected the Task motion command')
+
+        self._task_command_sequence += 1
+        command_id = f'task-{self._task_command_sequence}'
+        self._task_commands[command_id] = TaskCommandState(
+            TaskCommandStatus.PENDING,
+            'Goal request pending',
+        )
+
+        if command.kind in (
+            CommandKind.JOINT_ABSOLUTE,
+            CommandKind.JOINT_ABSOLUTE_MULTI,
+        ):
+            if (
+                self.joint_action_client is None
+                or Rby1JointCommand is None
+                or JointCommand is None
+                or not self.joint_action_client.server_is_ready()
+            ):
+                raise RuntimeError('Joint action server is unavailable')
+
+            joint_targets = (
+                command.joint_targets
+                if command.kind is CommandKind.JOINT_ABSOLUTE_MULTI
+                else ((str(command.group), command.values),)
+            )
+
+            goal = Rby1JointCommand.Goal()
+            group_labels = []
+            for group, target_values in joint_targets:
+                values_deg = list(target_values)
+                if not self._validate_joint_targets(group, values_deg):
+                    self._task_commands[command_id] = TaskCommandState(
+                        TaskCommandStatus.FAILED,
+                        f'{group} target violates a hard limit',
+                    )
+                    raise ValueError(
+                        f'Task {group} target violates a hard limit'
+                    )
+
+                velocity_limits = JOINT_MAX_VELOCITY_RAD.get(group)
+                acceleration_limits = JOINT_MAX_ACCELERATION_RAD.get(group)
+                if (
+                    velocity_limits is None
+                    or float(command.velocity_limit) > min(velocity_limits)
+                ):
+                    raise ValueError(
+                        f'Task {group} velocity_limit exceeds the '
+                        'verified model limit'
+                    )
+                if (
+                    acceleration_limits is None
+                    or any(value is None for value in acceleration_limits)
+                    or float(command.acceleration_limit) > min(
+                        float(value)
+                        for value in acceleration_limits
+                        if value is not None
+                    )
+                ):
+                    raise ValueError(
+                        f'Task {group} acceleration_limit is '
+                        'unverified or too high'
+                    )
+
+                message = JointCommand()
+                message.position = [
+                    math.radians(value) for value in values_deg
+                ]
+                message.minimum_time = float(command.minimum_time)
+                message.velocity_limit = float(command.velocity_limit)
+                message.acceleration_limit = float(
+                    command.acceleration_limit
+                )
+                message.use_impedance = False
+                message.use_group_joint = False
+                setattr(goal, group, message)
+                group_labels.append(group)
+
+            label = ' + '.join(group_labels)
+            self._send_motion_goal(
+                client=self.joint_action_client,
+                goal=goal,
+                label=f'Task Joint {label}',
+                task_id=command_id,
+            )
+        else:
+            arm = str(command.group)
+            if arm not in self.cartesian_links:
+                raise ValueError(f'unknown Cartesian arm: {arm}')
+            if (
+                self.cartesian_action_client is None
+                or Rby1CartesianCommand is None
+                or CartesianCommand is None
+                or not self.cartesian_action_client.server_is_ready()
+            ):
+                raise RuntimeError('Cartesian action server is unavailable')
+
+            ref_link, target_link = self.cartesian_links[arm]
+            values = command.values
+            message = CartesianCommand()
+            message.ref_link = ref_link
+            message.target_link = target_link
+            message.transform.translation.x = values[0]
+            message.transform.translation.y = values[1]
+            message.transform.translation.z = values[2]
+            qx, qy, qz, qw = self._rpy_deg_to_quaternion(*values[3:6])
+            message.transform.rotation.x = qx
+            message.transform.rotation.y = qy
+            message.transform.rotation.z = qz
+            message.transform.rotation.w = qw
+            message.minimum_time = float(command.minimum_time)
+            message.linear_velocity_limit = float(command.linear_velocity)
+            message.angular_velocity_limit = float(command.angular_velocity)
+            message.acceleration_limit_scaling = float(
+                command.acceleration_scaling
+            )
+            # Scenario Cartesian commands use the SDK builder path.
+            message.use_impedance = False
+
+            goal = Rby1CartesianCommand.Goal()
+            goal.stop_position_tracking_error = (
+                TASK_CARTESIAN_STOP_POSITION_ERROR_M
+            )
+            goal.stop_orientation_tracking_error = (
+                TASK_CARTESIAN_STOP_ORIENTATION_ERROR_RAD
+            )
+            setattr(goal, arm, message)
+            self._send_motion_goal(
+                client=self.cartesian_action_client,
+                goal=goal,
+                label=f'Task Cartesian {arm}',
+                task_id=command_id,
+            )
+
+        return command_id
+
+    def poll_task_command(self, command_id: str) -> TaskCommandState:
+        try:
+            return self._task_commands[command_id]
+        except KeyError as exc:
+            raise KeyError(f'unknown Task command: {command_id}') from exc
+
+    def cancel_task_command(self, command_id: str) -> None:
+        current = self._task_commands.get(command_id)
+        if current is not None and current.status is TaskCommandStatus.PENDING:
+            self._task_commands[command_id] = TaskCommandState(
+                TaskCommandStatus.CANCELED,
+                'Canceled by operator',
+            )
+        self.cancel_motion()
+
+    def _set_task_command_result(
+        self,
+        command_id: Optional[str],
+        status: TaskCommandStatus,
+        message: str,
+    ) -> None:
+        if command_id is None:
+            return
+        current = self._task_commands.get(command_id)
+        if current is None or current.status is not TaskCommandStatus.PENDING:
+            return
+        self._task_commands[command_id] = TaskCommandState(status, message)
+
     def _send_motion_goal(
         self,
         client,
         goal,
         label: str,
+        task_id: Optional[str] = None,
     ) -> None:
         self._motion_busy = True
         self._active_motion_kind = label
+        self._active_goal_handle = None
+        self._active_task_command_id = task_id
+        self._cancel_motion_on_accept = False
+        self._active_cancel_requested = False
 
         future = client.send_goal_async(goal)
         self._pending_futures.append(future)
 
         future.add_done_callback(
-            lambda done, motion_label=label:
+            lambda done, motion_label=label, command_id=task_id:
             self._motion_goal_response(
                 done,
                 motion_label,
+                command_id,
             )
         )
 
@@ -1219,6 +2040,7 @@ class Rby1ControlNode(Node):
         self,
         future,
         label: str,
+        task_id: Optional[str] = None,
     ) -> None:
         self._discard_future(future)
 
@@ -1228,6 +2050,14 @@ class Rby1ControlNode(Node):
             self._motion_busy = False
             self._active_motion_kind = None
             self._active_goal_handle = None
+            self._active_task_command_id = None
+            self._cancel_motion_on_accept = False
+            self._active_cancel_requested = False
+            self._set_task_command_result(
+                task_id,
+                TaskCommandStatus.FAILED,
+                str(exc),
+            )
 
             self._push_event(
                 'error',
@@ -1239,6 +2069,14 @@ class Rby1ControlNode(Node):
             self._motion_busy = False
             self._active_motion_kind = None
             self._active_goal_handle = None
+            self._active_task_command_id = None
+            self._cancel_motion_on_accept = False
+            self._active_cancel_requested = False
+            self._set_task_command_result(
+                task_id,
+                TaskCommandStatus.FAILED,
+                'Goal rejected',
+            )
 
             self._push_event(
                 'error',
@@ -1253,14 +2091,20 @@ class Rby1ControlNode(Node):
             f'{label} goal accepted.',
         )
 
+        # The direction key may have been released while send_goal_async()
+        # was still waiting for the server response.
+        if self._cancel_motion_on_accept:
+            self._request_active_goal_cancel(goal_handle)
+
         result_future = goal_handle.get_result_async()
         self._pending_futures.append(result_future)
 
         result_future.add_done_callback(
-            lambda done, motion_label=label:
+            lambda done, motion_label=label, command_id=task_id:
             self._motion_result_done(
                 done,
                 motion_label,
+                command_id,
             )
         )
 
@@ -1268,17 +2112,26 @@ class Rby1ControlNode(Node):
         self,
         future,
         label: str,
+        task_id: Optional[str] = None,
     ) -> None:
         self._discard_future(future)
 
         self._motion_busy = False
         self._active_motion_kind = None
         self._active_goal_handle = None
+        self._active_task_command_id = None
+        self._cancel_motion_on_accept = False
+        self._active_cancel_requested = False
 
         try:
             wrapped_result = future.result()
             result = wrapped_result.result
         except Exception as exc:
+            self._set_task_command_result(
+                task_id,
+                TaskCommandStatus.FAILED,
+                str(exc),
+            )
             self._push_event(
                 'error',
                 f'{label} result failed: {exc}',
@@ -1286,16 +2139,95 @@ class Rby1ControlNode(Node):
             return
 
         if bool(result.success):
+            self._set_task_command_result(
+                task_id,
+                TaskCommandStatus.SUCCEEDED,
+                str(result.finish_code),
+            )
             self._push_event(
                 'info',
                 f'{label} completed: '
                 f'{result.finish_code}',
             )
         else:
+            self._set_task_command_result(
+                task_id,
+                TaskCommandStatus.FAILED,
+                str(result.finish_code),
+            )
             self._push_event(
                 'warning',
                 f'{label} finished unsuccessfully: '
                 f'{result.finish_code}',
+            )
+
+    def is_motion_busy(self) -> bool:
+        """Return whether a Joint/Cartesian action is currently active."""
+        return bool(self._motion_busy)
+
+    def cancel_active_motion(self) -> None:
+        """Cancel only the current action goal, preserving stream state."""
+
+        if not self._motion_busy:
+            self._cancel_motion_on_accept = False
+            return
+
+        self._cancel_motion_on_accept = True
+
+        goal_handle = self._active_goal_handle
+        if goal_handle is None:
+            return
+
+        self._request_active_goal_cancel(goal_handle)
+
+    def _request_active_goal_cancel(self, goal_handle) -> None:
+        if self._active_cancel_requested:
+            return
+
+        self._active_cancel_requested = True
+
+        try:
+            future = goal_handle.cancel_goal_async()
+        except Exception as exc:
+            self._active_cancel_requested = False
+            self._push_event(
+                'warning',
+                f'Active motion cancel request failed: {exc}',
+            )
+            return
+
+        self._pending_futures.append(future)
+        future.add_done_callback(
+            self._active_motion_cancel_done
+        )
+
+    def _active_motion_cancel_done(self, future) -> None:
+        self._discard_future(future)
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            self._push_event(
+                'warning',
+                f'Active motion cancel failed: {exc}',
+            )
+            return
+
+        goals_canceling = getattr(
+            response,
+            'goals_canceling',
+            [],
+        )
+
+        if goals_canceling:
+            self._push_event(
+                'info',
+                'Active motion cancel accepted.',
+            )
+        else:
+            self._push_event(
+                'warning',
+                'Active motion cancel was not accepted.',
             )
 
     def cancel_motion(self) -> None:
@@ -1343,9 +2275,18 @@ class Rby1ControlNode(Node):
             return
 
         if result is not None and bool(result.success):
+            active_task_id = self._active_task_command_id
             self._motion_busy = False
             self._active_motion_kind = None
             self._active_goal_handle = None
+            self._active_task_command_id = None
+            self._cancel_motion_on_accept = False
+            self._active_cancel_requested = False
+            self._set_task_command_result(
+                active_task_id,
+                TaskCommandStatus.CANCELED,
+                str(result.message),
+            )
 
             self._push_event(
                 'info',
@@ -1549,6 +2490,107 @@ class Rby1ControlNode(Node):
             parameters='',
             value=value,
             label='Stream',
+        )
+
+    def request_control_manager(
+        self,
+        command: str,
+    ) -> None:
+        """Send ENABLE, DISABLE, or RESET to the Control Manager."""
+
+        if (
+            not self.services_enabled
+            or self.control_manager_client is None
+            or ControlManagerCommand is None
+        ):
+            self._push_event(
+                'warning',
+                'Control Manager service is unavailable.',
+            )
+            return
+
+        if not self.control_manager_client.service_is_ready():
+            self._push_event(
+                'warning',
+                'Control Manager service not ready: '
+                f'{self.control_manager_service}',
+            )
+            return
+
+        command_key = str(command).strip().lower()
+        command_values = {
+            'enable': ControlManagerCommand.Request.CMD_ENABLE,
+            'disable': ControlManagerCommand.Request.CMD_DISABLE,
+            'reset': ControlManagerCommand.Request.CMD_RESET,
+        }
+
+        command_value = command_values.get(command_key)
+        if command_value is None:
+            self._push_event(
+                'error',
+                f'Unknown Control Manager command: {command}',
+            )
+            return
+
+        # Stop locally commanded base velocity before commands that can
+        # remove/reset control authority. The driver handles its own stream
+        # shutdown for DISABLE / RESET.
+        if command_key in ('disable', 'reset'):
+            self.stop(publish_immediately=True)
+
+        request = ControlManagerCommand.Request()
+        request.command = int(command_value)
+
+        future = self.control_manager_client.call_async(request)
+        self._pending_futures.append(future)
+        future.add_done_callback(
+            lambda done, requested=command_key:
+            self._control_manager_done(done, requested)
+        )
+
+        self._push_event(
+            'info',
+            f'Control Manager {command_key.upper()} requested.',
+        )
+
+    def _control_manager_done(
+        self,
+        future,
+        command: str,
+    ) -> None:
+        """Process a ControlManagerCommand service response."""
+
+        self._discard_future(future)
+
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._push_event(
+                'error',
+                'Control Manager '
+                f'{command.upper()} call failed: {exc}',
+            )
+            return
+
+        if result is not None and bool(result.success):
+            message = getattr(result, 'message', '')
+            suffix = f': {message}' if message else ''
+            self._push_event(
+                'info',
+                'Control Manager '
+                f'{command.upper()} succeeded{suffix}',
+            )
+            return
+
+        message = (
+            getattr(result, 'message', 'No response')
+            if result is not None
+            else 'No response'
+        )
+        self._push_event(
+            'error',
+            'Control Manager '
+            f'{command.upper()} failed: {message}',
         )
 
     def _request_state_on_off(
@@ -1871,6 +2913,10 @@ class Rby1ControlNode(Node):
                 self.stream_client
                 and self.stream_client.service_is_ready()
             ),
+            'control_manager': bool(
+                self.control_manager_client
+                and self.control_manager_client.service_is_ready()
+            ),
             'cartesian_pose': bool(
                 self.cartesian_pose_client
                 and self.cartesian_pose_client.service_is_ready()
@@ -1878,6 +2924,10 @@ class Rby1ControlNode(Node):
             'cancel_control': bool(
                 self.cancel_control_client
                 and self.cancel_control_client.service_is_ready()
+            ),
+            'scenario_safety': bool(
+                self.scenario_safety_capabilities_client
+                and self.scenario_safety_capabilities_client.service_is_ready()
             ),
             'joint_action': bool(
                 self.joint_action_client
@@ -1889,6 +2939,28 @@ class Rby1ControlNode(Node):
             ),
         }
 
+        now = time.monotonic()
+
+        with self._lock:
+            power_enabled = self.power_enabled
+            servo_enabled = self.servo_enabled
+            power_feedback_time = self._power_feedback_time
+            servo_feedback_time = self._servo_feedback_time
+
+        if (
+            power_feedback_time is None
+            or now - power_feedback_time
+            > self.power_servo_feedback_timeout_sec
+        ):
+            power_enabled = None
+
+        if (
+            servo_feedback_time is None
+            or now - servo_feedback_time
+            > self.power_servo_feedback_timeout_sec
+        ):
+            servo_enabled = None
+
         return BackendSnapshot(
             namespace=self.get_namespace(),
 
@@ -1899,6 +2971,8 @@ class Rby1ControlNode(Node):
             ),
 
             control_state=self.control_state,
+            power_enabled=power_enabled,
+            servo_enabled=servo_enabled,
             stream_enabled=self.stream_enabled,
             emo_active=self.emo_active,
             collision_active=self.collision_active,

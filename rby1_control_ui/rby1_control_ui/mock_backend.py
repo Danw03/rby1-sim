@@ -18,7 +18,14 @@ import threading
 import time
 from typing import Deque, List, Tuple
 
-from .ros_backend import BackendSnapshot, VelocityCommand
+from .backend_contract import (
+    BackendSnapshot,
+    TaskBackendState,
+    TaskCommandState,
+    TaskCommandStatus,
+    VelocityCommand,
+)
+from .task_commands import CommandKind, TaskCommand
 
 
 class MockRby1Backend:
@@ -65,6 +72,8 @@ class MockRby1Backend:
 
         self._motion_active = False
         self._motion_description = ""
+        self._task_command_sequence = 0
+        self._task_commands = {}
 
         self._push_event("info", "Mock backend started.")
 
@@ -465,6 +474,96 @@ class MockRby1Backend:
             )
 
     # ==================================================================
+    # Asynchronous Task contract (immediate completion in Mock mode)
+    # ==================================================================
+    def task_state(self) -> TaskBackendState:
+        now = time.monotonic()
+        with self._lock:
+            return TaskBackendState(
+                captured_at=now,
+                robot_state_updated_at=now,
+                control_state=self.control_state,
+                emo_active=self.emo_active,
+                collision_active=self.collision_active,
+                motion_active=bool(self._motion_active),
+                joint_groups={
+                    key: tuple(values)
+                    for key, values in self._joint_groups.items()
+                },
+                joint_updated_at={
+                    key: now for key in self._joint_groups
+                },
+                joint_order_verified={
+                    key: True for key in self._joint_groups
+                },
+                cartesian={
+                    key: tuple(values)
+                    for key, values in self._cartesian.items()
+                },
+                cartesian_updated_at={
+                    key: now for key in self._cartesian
+                },
+                driver_safety_verified=True,
+                driver_safety_updated_at=now,
+            )
+
+    def start_task_command(self, command: TaskCommand) -> str:
+        if not self._motion_ready():
+            raise RuntimeError("Mock robot is not ready for Task motion")
+        if not isinstance(command, TaskCommand):
+            raise TypeError("command must be a TaskCommand")
+        if command.kind not in (
+            CommandKind.JOINT_ABSOLUTE,
+            CommandKind.JOINT_ABSOLUTE_MULTI,
+            CommandKind.LINEAR_ABSOLUTE,
+        ):
+            raise ValueError("backend accepts only resolved absolute commands")
+
+        with self._lock:
+            self._task_command_sequence += 1
+            command_id = f"mock-{self._task_command_sequence}"
+            if command.kind in (
+                CommandKind.JOINT_ABSOLUTE,
+                CommandKind.JOINT_ABSOLUTE_MULTI,
+            ):
+                joint_targets = (
+                    command.joint_targets
+                    if command.kind is CommandKind.JOINT_ABSOLUTE_MULTI
+                    else ((str(command.group), command.values),)
+                )
+                for group, values in joint_targets:
+                    self._joint_groups[group] = list(values)
+            else:
+                self._cartesian[str(command.group)] = list(command.values)
+
+            self._task_commands[command_id] = TaskCommandState(
+                TaskCommandStatus.SUCCEEDED,
+                "Mock command completed",
+            )
+
+        self._push_event(
+            "info",
+            f"MOCK Task command completed: {command.kind.value}",
+        )
+        return command_id
+
+    def poll_task_command(self, command_id: str) -> TaskCommandState:
+        with self._lock:
+            try:
+                return self._task_commands[command_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown Task command: {command_id}") from exc
+
+    def cancel_task_command(self, command_id: str) -> None:
+        with self._lock:
+            if command_id in self._task_commands:
+                self._task_commands[command_id] = TaskCommandState(
+                    TaskCommandStatus.CANCELED,
+                    "Canceled by operator",
+                )
+        self.cancel_motion()
+
+    # ==================================================================
     # Snapshot / diagnostics / shutdown
     # ==================================================================
     def snapshot(self) -> BackendSnapshot:
@@ -480,6 +579,8 @@ class MockRby1Backend:
             cmd_vel_topic="/mock/cmd_vel",
             cmd_vel_subscribers=1,
             control_state=self.control_state,
+            power_enabled=self.power_enabled,
+            servo_enabled=self.servo_enabled,
             stream_enabled=self.stream_enabled,
             emo_active=self.emo_active,
             collision_active=self.collision_active,
@@ -489,6 +590,12 @@ class MockRby1Backend:
                 "power": True,
                 "servo": True,
                 "stream": True,
+                "control_manager": True,
+                "joint_action": True,
+                "cartesian_action": True,
+                "cartesian_pose": True,
+                "cancel_control": True,
+                "scenario_safety": True,
             },
             command=cmd,
             command_stale=age > 0.35,
