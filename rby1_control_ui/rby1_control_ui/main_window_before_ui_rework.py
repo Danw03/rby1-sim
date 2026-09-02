@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from typing import Dict, Set
 
-from .scenario_ui import ScenarioPanel
 from .qt_compat import (
     QAbstractSpinBox,
     QApplication,
@@ -90,7 +89,6 @@ class MainWindow(QMainWindow):
         self._pressed_actions: Set[str] = set()
         self._action_buttons: Dict[str, QPushButton] = {}
         self._closing = False
-        self._scenario_active = False
 
         self._joint_target_cache = {
             key: [0.0] * dof
@@ -102,21 +100,11 @@ class MainWindow(QMainWindow):
         }
         self._latest_motion_state = {}
 
-        # Press-and-hold Cartesian direction control.
-        # Only one Cartesian hold command is active at a time because the
-        # backend intentionally allows one Joint/Cartesian motion goal at once.
-        self._cartesian_hold_command = None
-        self.cartesian_hold_timer = QTimer(self)
-        self.cartesian_hold_timer.setInterval(100)
-        self.cartesian_hold_timer.timeout.connect(
-            self._continue_cartesian_hold
-        )
-
         self.setWindowTitle("RB-Y1")
 
-        # Wider operator layout: both Cartesian arms are visible together.
-        self.setMinimumSize(980, 700)
-        self.resize(1120, 820)
+        # Compact enough to sit beside MuJoCo on a normal desktop.
+        self.setMinimumSize(760, 700)
+        self.resize(900, 820)
         self.setFocusPolicy(focus_policy("StrongFocus"))
 
         central = QWidget(self)
@@ -279,14 +267,17 @@ class MainWindow(QMainWindow):
         )
 
         # --------------------------------------------------------------
-        # State: horizontal operator view
+        # State: two side-by-side columns, matching the requested sketch.
         #
-        # Power/Servo/Stream | emphasized Control | EMO/Collision
+        # Power    ● ...      Control    ...
+        # Servo    ● ...      EMO        ...
+        # Stream   ● ...      Collision  ...
         # --------------------------------------------------------------
         state_group = QGroupBox("State")
-        state_layout = QHBoxLayout(state_group)
-        state_layout.setContentsMargins(8, 7, 8, 7)
-        state_layout.setSpacing(12)
+        state_layout = QGridLayout(state_group)
+        state_layout.setContentsMargins(8, 6, 8, 5)
+        state_layout.setHorizontalSpacing(8)
+        state_layout.setVerticalSpacing(4)
 
         # Power / Servo do not currently have independent feedback in
         # BackendSnapshot, so they intentionally remain UNKNOWN for now.
@@ -294,61 +285,38 @@ class MainWindow(QMainWindow):
         self.servo_state_value = self._status_indicator()
         self.stream_value = self._status_indicator()
 
-        # Left column: Power / Servo / Stream.
-        left_state_widget = QWidget()
-        left_state_layout = QGridLayout(left_state_widget)
-        left_state_layout.setContentsMargins(0, 0, 0, 0)
-        left_state_layout.setHorizontalSpacing(7)
-        left_state_layout.setVerticalSpacing(5)
-
-        left_state_layout.addWidget(QLabel("Power"), 0, 0)
-        left_state_layout.addWidget(self.power_state_value, 0, 1)
-        left_state_layout.addWidget(QLabel("Servo"), 1, 0)
-        left_state_layout.addWidget(self.servo_state_value, 1, 1)
-        left_state_layout.addWidget(QLabel("Stream"), 2, 0)
-        left_state_layout.addWidget(self.stream_value, 2, 1)
-
-        # Center: Control is intentionally the most prominent state.
-        control_frame = QFrame()
-        control_frame.setObjectName("controlStateCard")
-        control_frame.setMinimumWidth(170)
-        control_frame.setMinimumHeight(78)
-
-        control_layout = QVBoxLayout(control_frame)
-        control_layout.setContentsMargins(12, 7, 12, 7)
-        control_layout.setSpacing(2)
-
-        control_title = QLabel("CONTROL")
-        control_title.setObjectName("controlStateTitle")
-        control_title.setAlignment(alignment("AlignCenter"))
-
         self.state_value = QLabel("UNKNOWN")
-        self.state_value.setObjectName("controlStateValue")
-        self.state_value.setAlignment(alignment("AlignCenter"))
-
-        control_layout.addWidget(control_title)
-        control_layout.addWidget(self.state_value, 1)
-
-        # Right column: EMO / Collision.
-        right_state_widget = QWidget()
-        right_state_layout = QGridLayout(right_state_widget)
-        right_state_layout.setContentsMargins(0, 0, 0, 0)
-        right_state_layout.setHorizontalSpacing(7)
-        right_state_layout.setVerticalSpacing(8)
-
         self.emo_value = QLabel("UNKNOWN")
         self.collision_value = QLabel("UNKNOWN")
-        self.emo_value.setObjectName("stateValue")
-        self.collision_value.setObjectName("stateValue")
 
-        right_state_layout.addWidget(QLabel("EMO"), 0, 0)
-        right_state_layout.addWidget(self.emo_value, 0, 1)
-        right_state_layout.addWidget(QLabel("Collision"), 1, 0)
-        right_state_layout.addWidget(self.collision_value, 1, 1)
+        for value in (
+            self.state_value,
+            self.emo_value,
+            self.collision_value,
+        ):
+            value.setObjectName("stateValue")
 
-        state_layout.addWidget(left_state_widget)
-        state_layout.addWidget(control_frame, 2)
-        state_layout.addWidget(right_state_widget)
+        # Left state column.
+        state_layout.addWidget(QLabel("Power"), 0, 0)
+        state_layout.addWidget(self.power_state_value, 0, 1)
+        state_layout.addWidget(QLabel("Servo"), 1, 0)
+        state_layout.addWidget(self.servo_state_value, 1, 1)
+        state_layout.addWidget(QLabel("Stream"), 2, 0)
+        state_layout.addWidget(self.stream_value, 2, 1)
+
+        # Visual gap between the two state columns.
+        state_layout.setColumnMinimumWidth(2, 10)
+
+        # Right state column.
+        state_layout.addWidget(QLabel("Control"), 0, 3)
+        state_layout.addWidget(self.state_value, 0, 4)
+        state_layout.addWidget(QLabel("EMO"), 1, 3)
+        state_layout.addWidget(self.emo_value, 1, 4)
+        state_layout.addWidget(QLabel("Collision"), 2, 3)
+        state_layout.addWidget(self.collision_value, 2, 4)
+
+        state_layout.setColumnStretch(1, 1)
+        state_layout.setColumnStretch(4, 1)
 
         # --------------------------------------------------------------
         # Hardware EMO / E-Stop status
@@ -402,35 +370,6 @@ class MainWindow(QMainWindow):
         # Re-polish so object-name based style updates immediately.
         label.style().unpolish(label)
         label.style().polish(label)
-
-    @staticmethod
-    def _empty_vector(count: int) -> str:
-        return "[ " + ", ".join("-" for _ in range(count)) + " ]"
-
-    @staticmethod
-    def _format_joint_vector(values, count: int) -> str:
-        rendered = []
-        for index in range(count):
-            if index < len(values):
-                rendered.append(f"{float(values[index]):+.2f}")
-            else:
-                rendered.append("-")
-        return "[ " + ", ".join(rendered) + " ]"
-
-    @staticmethod
-    def _format_tcp_vector(values) -> str:
-        rendered = []
-        for index in range(6):
-            if index >= len(values):
-                rendered.append("-")
-                continue
-
-            value = float(values[index])
-            rendered.append(
-                f"{value:+.4f}" if index < 3 else f"{value:+.2f}"
-            )
-
-        return "[ " + ", ".join(rendered) + " ]"
 
     def _set_estop_status(self, emo_active) -> None:
         """Mirror physical EMO feedback without exposing a fake E-Stop command."""
@@ -787,12 +726,6 @@ class MainWindow(QMainWindow):
         self.joint_panel.setVisible(mode == "joint")
         self.cartesian_panel.setVisible(mode == "cartesian")
 
-        # Cartesian has dedicated Copy / MOVE buttons for each arm.
-        if hasattr(self, "copy_current_button"):
-            self.copy_current_button.setVisible(mode == "joint")
-        if hasattr(self, "move_target_button"):
-            self.move_target_button.setVisible(mode == "joint")
-
     def _build_joint_space_panel(self) -> QGroupBox:
         panel = QGroupBox("Joint Space Motion")
         root = QVBoxLayout(panel)
@@ -814,28 +747,34 @@ class MainWindow(QMainWindow):
         selector_layout.addRow("Component", self.joint_group_selector)
         root.addWidget(selector_group)
 
-        # --------------------------------------------------------------
-        # Get q snapshot: compact vector display
-        # --------------------------------------------------------------
+        #------------Get q button and snapshot display---------------------
         snapshot_group = QGroupBox("Joint Snapshot")
-        snapshot_layout = QHBoxLayout(snapshot_group)
-        snapshot_layout.setContentsMargins(8, 6, 8, 6)
-        snapshot_layout.setSpacing(8)
+        snapshot_layout = QGridLayout(snapshot_group)
+        snapshot_layout.setHorizontalSpacing(6)
+        snapshot_layout.setVerticalSpacing(3)
 
         self.get_q_button = QPushButton("Get q")
         self.get_q_button.clicked.connect(self._get_joint_snapshot)
 
-        self.joint_snapshot_value = QLabel(
-            self._empty_vector(self.JOINT_GROUPS[self._selected_joint_group()][1])
-        )
-        self.joint_snapshot_value.setObjectName("vectorSnapshot")
-        self.joint_snapshot_value.setAlignment(alignment("AlignCenter"))
-        self.joint_snapshot_value.setMinimumHeight(30)
+        snapshot_layout.addWidget(self.get_q_button, 1, 0)
 
-        snapshot_layout.addWidget(self.get_q_button)
-        snapshot_layout.addWidget(self.joint_snapshot_value, 1)
+        self.joint_snapshot_headers = []
+        self.joint_snapshot_values = []
 
-        # Snapshot and joint jog settings are placed side-by-side below.
+        for index in range(7):
+            header = QLabel(f"J{index + 1}")
+            value = QLabel("--")
+
+            header.setAlignment(alignment("AlignCenter"))
+            value.setAlignment(alignment("AlignCenter"))
+
+            self.joint_snapshot_headers.append(header)
+            self.joint_snapshot_values.append(value)
+
+            snapshot_layout.addWidget(header, 0, index + 1)
+            snapshot_layout.addWidget(value, 1, index + 1)
+
+        root.addWidget(snapshot_group)
 
         # --------------------------------------------------------------
         # Current / target / jog table
@@ -948,12 +887,7 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(QLabel("Minimum time"), 1, 0)
         settings_layout.addWidget(self.joint_minimum_time, 1, 1)
 
-        # Keep the compact status/readback controls together at the top.
-        joint_tools_row = QHBoxLayout()
-        joint_tools_row.setSpacing(8)
-        joint_tools_row.addWidget(snapshot_group, 3)
-        joint_tools_row.addWidget(settings, 2)
-        root.insertLayout(1, joint_tools_row)
+        root.addWidget(settings)
 
         self._on_joint_group_changed()
         return panel
@@ -961,135 +895,95 @@ class MainWindow(QMainWindow):
     def _build_cartesian_space_panel(self) -> QGroupBox:
         panel = QGroupBox("Cartesian Space Motion")
         root = QVBoxLayout(panel)
-        root.setSpacing(8)
-
-        # The selector is intentionally removed: Left and Right are shown
-        # simultaneously and each arm owns its own snapshot / target controls.
-        self.tcp_snapshot_values = {}
-        self.get_tcp_buttons = {}
-
-        self.cartesian_current_labels = {}
-        self.cartesian_target_spins = {}
-        self.cartesian_minus_buttons = {}
-        self.cartesian_plus_buttons = {}
+        root.setSpacing(9)
 
         # --------------------------------------------------------------
-        # Top row: independent Left/Right TCP snapshots + shared jog settings
+        # End-effector selector
+        # Reference frame is intentionally fixed to "base" in Day 3.
         # --------------------------------------------------------------
-        top_row = QHBoxLayout()
-        top_row.setSpacing(8)
+        selector_group = QGroupBox("End Effector")
+        selector_layout = QFormLayout(selector_group)
+
+        self.cartesian_arm_selector = QComboBox()
+        for key, label in self.CARTESIAN_ARMS.items():
+            self.cartesian_arm_selector.addItem(label, key)
+
+        self.cartesian_arm_selector.currentIndexChanged.connect(
+            self._on_cartesian_arm_changed
+        )
+
+        selector_layout.addRow("Arm", self.cartesian_arm_selector)
+        root.addWidget(selector_group)
 
         snapshot_group = QGroupBox("TCP Snapshot")
         snapshot_layout = QGridLayout(snapshot_group)
-        snapshot_layout.setHorizontalSpacing(7)
-        snapshot_layout.setVerticalSpacing(5)
-        snapshot_layout.setColumnStretch(1, 1)
+        snapshot_layout.setHorizontalSpacing(8)
+        snapshot_layout.setVerticalSpacing(3)
 
-        for row, (arm, label) in enumerate(
-            (
-                ("left_arm", "Left TCP"),
-                ("right_arm", "Right TCP"),
-            )
-        ):
-            snapshot_label = QLabel(self._empty_vector(6))
-            snapshot_label.setObjectName("vectorSnapshot")
-            snapshot_label.setAlignment(alignment("AlignCenter"))
-            snapshot_label.setMinimumHeight(29)
-
-            button = QPushButton("Get TCP")
-            button.clicked.connect(
-                lambda checked=False, arm_name=arm:
-                self._get_cartesian_snapshot(arm_name)
-            )
-
-            snapshot_layout.addWidget(QLabel(label), row, 0)
-            snapshot_layout.addWidget(snapshot_label, row, 1)
-            snapshot_layout.addWidget(button, row, 2)
-
-            self.tcp_snapshot_values[arm] = snapshot_label
-            self.get_tcp_buttons[arm] = button
-
-        settings = QGroupBox("Jog Settings")
-        settings_layout = QGridLayout(settings)
-        settings_layout.setHorizontalSpacing(7)
-        settings_layout.setVerticalSpacing(5)
-
-        self.cartesian_linear_step = QDoubleSpinBox()
-        self.cartesian_linear_step.setDecimals(3)
-        self.cartesian_linear_step.setRange(0.001, 0.200)
-        self.cartesian_linear_step.setSingleStep(0.005)
-        self.cartesian_linear_step.setValue(0.010)
-        self.cartesian_linear_step.setSuffix(" m")
-
-        self.cartesian_angular_step = QDoubleSpinBox()
-        self.cartesian_angular_step.setDecimals(1)
-        self.cartesian_angular_step.setRange(0.5, 30.0)
-        self.cartesian_angular_step.setSingleStep(0.5)
-        self.cartesian_angular_step.setValue(5.0)
-        self.cartesian_angular_step.setSuffix("°")
-
-        self.cartesian_minimum_time = QDoubleSpinBox()
-        self.cartesian_minimum_time.setDecimals(1)
-        self.cartesian_minimum_time.setRange(0.1, 30.0)
-        self.cartesian_minimum_time.setSingleStep(0.5)
-        self.cartesian_minimum_time.setValue(3.0)
-        self.cartesian_minimum_time.setSuffix(" s")
-
-        settings_layout.addWidget(QLabel("Linear"), 0, 0)
-        settings_layout.addWidget(self.cartesian_linear_step, 0, 1)
-        settings_layout.addWidget(QLabel("Angular"), 1, 0)
-        settings_layout.addWidget(self.cartesian_angular_step, 1, 1)
-        settings_layout.addWidget(QLabel("Min time"), 2, 0)
-        settings_layout.addWidget(self.cartesian_minimum_time, 2, 1)
-
-        # Keep the TCP snapshots and jog settings on one compact row,
-        # matching the Joint Space layout.
-        settings.setMaximumWidth(300)
-        top_row.addWidget(snapshot_group, 4)
-        top_row.addWidget(settings, 2)
-        root.addLayout(top_row)
-
-        # --------------------------------------------------------------
-        # Main area: Left Arm and Right Arm are always visible together.
-        # --------------------------------------------------------------
-        arms_row = QHBoxLayout()
-        arms_row.setSpacing(8)
-
-        left_panel = self._build_cartesian_arm_panel(
-            "left_arm",
-            "Left Arm",
-        )
-        right_panel = self._build_cartesian_arm_panel(
-            "right_arm",
-            "Right Arm",
+        snapshot_names = (
+            "X", "Y", "Z",
+            "Roll", "Pitch", "Yaw",
         )
 
-        arms_row.addWidget(left_panel, 1)
-        arms_row.addWidget(right_panel, 1)
-        root.addLayout(arms_row, 1)
+        self.tcp_snapshot_values = []
 
-        return panel
+        for index, name in enumerate(snapshot_names):
+            if index < 3:
+                header_row = 0
+                value_row = 1
+                column = index
+            else:
+                header_row = 2
+                value_row = 3
+                column = index - 3
 
-    def _build_cartesian_arm_panel(
-        self,
-        arm: str,
-        title: str,
-    ) -> QGroupBox:
-        """Build one arm's Current / Target / Jog and direction-key UI."""
+            header = QLabel(name)
+            value = QLabel("--")
 
-        group = QGroupBox(title)
-        root = QVBoxLayout(group)
-        root.setSpacing(6)
+            header.setAlignment(alignment("AlignCenter"))
+            value.setAlignment(alignment("AlignCenter"))
 
-        motion_widget = QWidget()
-        grid = QGridLayout(motion_widget)
-        grid.setContentsMargins(2, 2, 2, 2)
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(5)
+            snapshot_layout.addWidget(
+                header,
+                header_row,
+                column,
+            )
+            snapshot_layout.addWidget(
+                value,
+                value_row,
+                column,
+            )
+
+            self.tcp_snapshot_values.append(value)
+
+        self.get_tcp_button = QPushButton("Get TCP")
+        self.get_tcp_button.clicked.connect(
+            self._get_cartesian_snapshot
+        )
+
+        snapshot_layout.addWidget(
+            self.get_tcp_button,
+            0,
+            3,
+            4,
+            1,
+        )
+
+        root.addWidget(snapshot_group)
+
+        # --------------------------------------------------------------
+        # Cartesian current / target / jog table
+        # Same interaction pattern as Joint Space Motion.
+        # --------------------------------------------------------------
+        motion_group = QGroupBox("TCP Motion")
+        motion_group.setMinimumHeight(215)
+        grid = QGridLayout(motion_group)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
 
         grid.setColumnStretch(0, 0)
         grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 0)
+        grid.setColumnStretch(2, 2)
         grid.setColumnStretch(3, 0)
         grid.setColumnStretch(4, 0)
 
@@ -1111,15 +1005,15 @@ class MainWindow(QMainWindow):
             ("X", " m", -2.0, 2.0, 3),
             ("Y", " m", -2.0, 2.0, 3),
             ("Z", " m", -2.0, 2.0, 3),
-            ("R", "°", -180.0, 180.0, 1),
-            ("P", "°", -180.0, 180.0, 1),
-            ("Y", "°", -180.0, 180.0, 1),
+            ("Roll", "°", -180.0, 180.0, 1),
+            ("Pitch", "°", -180.0, 180.0, 1),
+            ("Yaw", "°", -180.0, 180.0, 1),
         )
 
-        current_labels = []
-        target_spins = []
-        minus_buttons = []
-        plus_buttons = []
+        self.cartesian_current_labels = []
+        self.cartesian_target_spins = []
+        self.cartesian_minus_buttons = []
+        self.cartesian_plus_buttons = []
 
         for index, (axis, suffix, minimum, maximum, decimals) in enumerate(
             axis_specs
@@ -1127,46 +1021,32 @@ class MainWindow(QMainWindow):
             row = index + 1
 
             axis_label = QLabel(axis)
+
             current = QLabel("--")
             current.setAlignment(alignment("AlignCenter"))
-            current.setMinimumWidth(76)
+            current.setMinimumWidth(90)
 
             target = QDoubleSpinBox()
-            target.setFixedWidth(88)
+            target.setMinimumWidth(150)
             target.setDecimals(decimals)
             target.setRange(minimum, maximum)
             target.setSingleStep(0.01 if index < 3 else 1.0)
             target.setSuffix(suffix)
             target.setKeyboardTracking(False)
             target.valueChanged.connect(
-                lambda value, arm_name=arm, i=index:
-                self._on_cartesian_target_changed(
-                    arm_name,
-                    i,
-                    value,
-                )
+                lambda value, i=index: self._on_cartesian_target_changed(i, value)
             )
 
             minus = QPushButton("−")
             plus = QPushButton("+")
-            minus.setFixedSize(34, 28)
-            plus.setFixedSize(34, 28)
+            minus.setFixedSize(38, 28)
+            plus.setFixedSize(38, 28)
 
             minus.clicked.connect(
-                lambda checked=False, arm_name=arm, i=index:
-                self._cartesian_jog(
-                    arm_name,
-                    i,
-                    -1,
-                )
+                lambda checked=False, i=index: self._cartesian_jog(i, -1)
             )
             plus.clicked.connect(
-                lambda checked=False, arm_name=arm, i=index:
-                self._cartesian_jog(
-                    arm_name,
-                    i,
-                    +1,
-                )
+                lambda checked=False, i=index: self._cartesian_jog(i, +1)
             )
 
             grid.addWidget(axis_label, row, 0)
@@ -1175,77 +1055,53 @@ class MainWindow(QMainWindow):
             grid.addWidget(minus, row, 3)
             grid.addWidget(plus, row, 4)
 
-            current_labels.append(current)
-            target_spins.append(target)
-            minus_buttons.append(minus)
-            plus_buttons.append(plus)
+            self.cartesian_current_labels.append(current)
+            self.cartesian_target_spins.append(target)
+            self.cartesian_minus_buttons.append(minus)
+            self.cartesian_plus_buttons.append(plus)
 
-        self.cartesian_current_labels[arm] = current_labels
-        self.cartesian_target_spins[arm] = target_spins
-        self.cartesian_minus_buttons[arm] = minus_buttons
-        self.cartesian_plus_buttons[arm] = plus_buttons
+        root.addWidget(motion_group, 1)
 
-        root.addWidget(motion_widget, 1)
+        # --------------------------------------------------------------
+        # Cartesian motion settings
+        # --------------------------------------------------------------
+        settings = QGroupBox("Cartesian Motion Settings")
+        settings_layout = QGridLayout(settings)
+        settings_layout.setHorizontalSpacing(10)
+        settings_layout.setVerticalSpacing(6)
 
-        # Per-arm target commands replace the old global arm selector.
-        command_row = QHBoxLayout()
-        copy_button = QPushButton("Copy Current → Target")
-        move_button = QPushButton("MOVE TARGET")
+        self.cartesian_linear_step = QDoubleSpinBox()
+        self.cartesian_linear_step.setDecimals(3)
+        self.cartesian_linear_step.setRange(0.001, 0.200)
+        self.cartesian_linear_step.setSingleStep(0.005)
+        self.cartesian_linear_step.setValue(0.010)
+        self.cartesian_linear_step.setSuffix(" m / click")
 
-        copy_button.clicked.connect(
-            lambda checked=False, arm_name=arm:
-            self._copy_current_cartesian_to_target(arm_name)
-        )
-        move_button.clicked.connect(
-            lambda checked=False, arm_name=arm:
-            self._move_cartesian_target(arm_name)
-        )
+        self.cartesian_angular_step = QDoubleSpinBox()
+        self.cartesian_angular_step.setDecimals(1)
+        self.cartesian_angular_step.setRange(0.5, 30.0)
+        self.cartesian_angular_step.setSingleStep(0.5)
+        self.cartesian_angular_step.setValue(5.0)
+        self.cartesian_angular_step.setSuffix("° / click")
 
-        command_row.addWidget(copy_button, 1)
-        command_row.addWidget(move_button, 1)
-        root.addLayout(command_row)
+        self.cartesian_minimum_time = QDoubleSpinBox()
+        self.cartesian_minimum_time.setDecimals(1)
+        self.cartesian_minimum_time.setRange(0.1, 30.0)
+        self.cartesian_minimum_time.setSingleStep(0.5)
+        self.cartesian_minimum_time.setValue(3.0)
+        self.cartesian_minimum_time.setSuffix(" s")
 
-        # Direction keys use the same linear jog backend as X/Y/Z row buttons.
-        direction_group = QGroupBox("Direction Key")
-        direction_layout = QGridLayout(direction_group)
-        direction_layout.setHorizontalSpacing(5)
-        direction_layout.setVerticalSpacing(5)
+        settings_layout.addWidget(QLabel("Linear jog"), 0, 0)
+        settings_layout.addWidget(self.cartesian_linear_step, 0, 1)
+        settings_layout.addWidget(QLabel("Angular jog"), 1, 0)
+        settings_layout.addWidget(self.cartesian_angular_step, 1, 1)
+        settings_layout.addWidget(QLabel("Minimum time"), 2, 0)
+        settings_layout.addWidget(self.cartesian_minimum_time, 2, 1)
 
-        # XY buttons form a cross; Z buttons are a separate vertical pair.
-        # This mirrors the operator sketch and keeps each key visually compact.
-        direction_layout.setColumnMinimumWidth(3, 14)
-        direction_specs = (
-            ("+X", 0, +1, 0, 1),
-            ("−Y", 1, -1, 1, 0),
-            ("+Y", 1, +1, 1, 2),
-            ("−X", 0, -1, 2, 1),
-            ("+Z", 2, +1, 0, 4),
-            ("−Z", 2, -1, 2, 4),
-        )
+        root.addWidget(settings)
 
-        for text, axis_index, direction, row, column in direction_specs:
-            button = QPushButton(text)
-            button.setFixedSize(48, 28)
-
-            # Direction keys are press-and-hold controls. The small +/- buttons
-            # in the pose table remain discrete one-click jogs.
-            button.pressed.connect(
-                lambda arm_name=arm,
-                i=axis_index,
-                d=direction:
-                self._start_cartesian_hold(
-                    arm_name,
-                    i,
-                    d,
-                )
-            )
-            button.released.connect(
-                self._stop_cartesian_hold
-            )
-            direction_layout.addWidget(button, row, column)
-
-        root.addWidget(direction_group)
-        return group
+        self._on_cartesian_arm_changed()
+        return panel
 
     # ------------------------------------------------------------------
     # Joint-space UI callbacks
@@ -1273,9 +1129,17 @@ class MainWindow(QMainWindow):
             return
 
         _, dof = self.JOINT_GROUPS[group]
-        self.joint_snapshot_value.setText(
-            self._format_joint_vector(values, dof)
-        )
+
+        for index in range(7):
+            visible = index < dof
+
+            self.joint_snapshot_headers[index].setVisible(visible)
+            self.joint_snapshot_values[index].setVisible(visible)
+
+            if visible:
+                self.joint_snapshot_values[index].setText(
+                    f"{values[index]:.2f}"
+                )
 
     def _on_joint_group_changed(self, *args) -> None:
         del args
@@ -1299,10 +1163,14 @@ class MainWindow(QMainWindow):
             self.joint_target_spins[index].setValue(cached_targets[index])
             self.joint_target_spins[index].blockSignals(False)
 
-        if hasattr(self, "joint_snapshot_value"):
-            self.joint_snapshot_value.setText(
-                self._empty_vector(dof)
-            )
+        if hasattr(self, "joint_snapshot_headers"):
+            for index in range(7):
+                visible = index < dof
+
+                self.joint_snapshot_headers[index].setVisible(visible)
+                self.joint_snapshot_values[index].setVisible(visible)
+
+                self.joint_snapshot_values[index].setText("--")
 
         self.append_log(
             "info",
@@ -1391,9 +1259,11 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Cartesian-space UI callbacks
     # ------------------------------------------------------------------
-    def _get_cartesian_snapshot(self, arm: str) -> None:
-        if arm not in self.CARTESIAN_ARMS:
-            return
+    def _selected_cartesian_arm(self) -> str:
+        return str(self.cartesian_arm_selector.currentData())
+
+    def _get_cartesian_snapshot(self) -> None:
+        arm = self._selected_cartesian_arm()
 
         if not hasattr(
             self.backend,
@@ -1412,107 +1282,49 @@ class MainWindow(QMainWindow):
         if not requested:
             self.append_log(
                 "warning",
-                f"Get TCP request could not be started for {arm}.",
+                "Get TCP request could not be started.",
             )
             return
 
-        self.tcp_snapshot_values[arm].setText(
-            "[ ..., ..., ..., ..., ..., ... ]"
+        for label in self.tcp_snapshot_values:
+            label.setText("...")
+
+    def _on_cartesian_arm_changed(self, *args) -> None:
+        del args
+        if not hasattr(self, "cartesian_arm_selector"):
+            return
+
+        arm = self._selected_cartesian_arm()
+        cached = self._cartesian_target_cache[arm]
+
+        for index, value in enumerate(cached):
+            self.cartesian_target_spins[index].blockSignals(True)
+            self.cartesian_target_spins[index].setValue(value)
+            self.cartesian_target_spins[index].blockSignals(False)
+
+        self.append_log(
+            "info",
+            f"Cartesian arm selected: {self.CARTESIAN_ARMS[arm]}.",
         )
+
+        if hasattr(self, "tcp_snapshot_values"):
+            for label in self.tcp_snapshot_values:
+                label.setText("--")
 
     def _on_cartesian_target_changed(
         self,
-        arm: str,
         index: int,
         value: float,
     ) -> None:
-        if arm not in self._cartesian_target_cache:
-            return
+        arm = self._selected_cartesian_arm()
         self._cartesian_target_cache[arm][index] = float(value)
-
-    def _start_cartesian_hold(
-        self,
-        arm: str,
-        axis_index: int,
-        direction: int,
-    ) -> None:
-        """Start press-and-hold Cartesian translation control."""
-
-        if arm not in self.CARTESIAN_ARMS:
-            return
-        if axis_index < 0 or axis_index >= 3:
-            return
-
-        if (
-            self._cartesian_hold_command is not None
-            and self._cartesian_hold_command
-            != (arm, axis_index, direction)
-            and hasattr(self.backend, "cancel_active_motion")
-        ):
-            self.backend.cancel_active_motion()
-
-        self._cartesian_hold_command = (
-            arm,
-            int(axis_index),
-            int(direction),
-        )
-
-        if not self.cartesian_hold_timer.isActive():
-            self.cartesian_hold_timer.start()
-
-        self._continue_cartesian_hold()
-
-    def _continue_cartesian_hold(self) -> None:
-        """Issue the next jog step after the previous action has finished."""
-
-        command = self._cartesian_hold_command
-        if command is None:
-            self.cartesian_hold_timer.stop()
-            return
-
-        if (
-            hasattr(self.backend, "is_motion_busy")
-            and self.backend.is_motion_busy()
-        ):
-            return
-
-        arm, axis_index, direction = command
-        self._cartesian_jog(
-            arm,
-            axis_index,
-            direction,
-        )
-
-    def _stop_cartesian_hold(
-        self,
-        *args,
-        cancel_motion: bool = True,
-    ) -> None:
-        """Stop a held direction key and cancel its current action goal."""
-
-        del args
-
-        was_active = self._cartesian_hold_command is not None
-        self._cartesian_hold_command = None
-        self.cartesian_hold_timer.stop()
-
-        # Action-level cancel stops the current arm command without using the
-        # stronger global cancel_control service.
-        if (
-            was_active
-            and cancel_motion
-            and hasattr(self.backend, "cancel_active_motion")
-        ):
-            self.backend.cancel_active_motion()
 
     def _cartesian_jog(
         self,
-        arm: str,
         axis_index: int,
         direction: int,
     ) -> None:
-        if arm not in self.CARTESIAN_ARMS:
-            return
+        arm = self._selected_cartesian_arm()
 
         if axis_index < 3:
             delta = float(self.cartesian_linear_step.value())
@@ -1543,13 +1355,12 @@ class MainWindow(QMainWindow):
             reference_frame="base",
         )
 
-    def _move_cartesian_target(self, arm: str) -> None:
-        if arm not in self.CARTESIAN_ARMS:
-            return
+    def _move_cartesian_target(self) -> None:
+        arm = self._selected_cartesian_arm()
 
         target = [
             float(spin.value())
-            for spin in self.cartesian_target_spins[arm]
+            for spin in self.cartesian_target_spins
         ]
         self._cartesian_target_cache[arm] = list(target)
 
@@ -1567,17 +1378,15 @@ class MainWindow(QMainWindow):
             reference_frame="base",
         )
 
-    def _copy_current_cartesian_to_target(self, arm: str) -> None:
-        if arm not in self.CARTESIAN_ARMS:
-            return
-
+    def _copy_current_cartesian_to_target(self) -> None:
+        arm = self._selected_cartesian_arm()
         state = self._latest_motion_state.get("cartesian", {})
         current = state.get(arm)
 
         if current is None:
             self.append_log(
                 "warning",
-                f"No current Cartesian state is available for {arm}.",
+                "No current Cartesian state is available to copy.",
             )
             return
 
@@ -1585,26 +1394,25 @@ class MainWindow(QMainWindow):
         self._cartesian_target_cache[arm] = values
 
         for index, value in enumerate(values):
-            spin = self.cartesian_target_spins[arm][index]
-            spin.blockSignals(True)
-            spin.setValue(value)
-            spin.blockSignals(False)
+            self.cartesian_target_spins[index].blockSignals(True)
+            self.cartesian_target_spins[index].setValue(value)
+            self.cartesian_target_spins[index].blockSignals(False)
 
     def _copy_selected_current_to_target(self) -> None:
-        # Joint mode keeps the existing selected-group workflow.
-        # Cartesian mode has independent per-arm buttons.
         mode = str(self.motion_type_selector.currentData())
 
         if mode == "joint":
             self._copy_current_joint_to_target()
+        elif mode == "cartesian":
+            self._copy_current_cartesian_to_target()
 
     def _move_selected_target(self) -> None:
-        # Joint mode keeps the existing selected-group workflow.
-        # Cartesian mode has independent per-arm buttons.
         mode = str(self.motion_type_selector.currentData())
 
         if mode == "joint":
             self._move_joint_target()
+        elif mode == "cartesian":
+            self._move_cartesian_target()
 
     def _cancel_arm_motion(self) -> None:
         if hasattr(self.backend, "cancel_motion"):
@@ -1639,65 +1447,60 @@ class MainWindow(QMainWindow):
                 else:
                     self.joint_current_labels[index].setText("--")
 
-        # Cartesian state: Left and Right are rendered simultaneously.
-        cartesian_state = state.get("cartesian", {})
-        for arm in ("left_arm", "right_arm"):
-            cartesian = cartesian_state.get(arm)
-            labels = self.cartesian_current_labels.get(arm, [])
+        # Cartesian state: only the selected arm is displayed.
+        arm = self._selected_cartesian_arm()
+        cartesian = state.get("cartesian", {}).get(arm)
 
-            if cartesian is None:
-                continue
-
+        if cartesian is not None:
             for index in range(6):
-                if index >= len(labels):
-                    continue
                 if index >= len(cartesian):
-                    labels[index].setText("--")
+                    self.cartesian_current_labels[index].setText("--")
                     continue
 
                 value = float(cartesian[index])
                 if index < 3:
-                    labels[index].setText(
+                    self.cartesian_current_labels[index].setText(
                         f"{value:+.4f} m"
                     )
                 else:
-                    labels[index].setText(
+                    self.cartesian_current_labels[index].setText(
                         f"{value:+.2f}°"
                     )
 
-        # Get TCP snapshots are independent for Left and Right.
         if hasattr(
             self.backend,
             "get_cartesian_snapshot",
         ):
-            for arm in ("left_arm", "right_arm"):
-                snapshot = self.backend.get_cartesian_snapshot(
-                    arm
-                )
+            arm = self._selected_cartesian_arm()
 
-                if snapshot is not None:
-                    self.tcp_snapshot_values[arm].setText(
-                        self._format_tcp_vector(snapshot)
-                    )
+            snapshot = self.backend.get_cartesian_snapshot(
+                arm
+            )
+
+            if snapshot is not None:
+                for index in range(6):
+                    if index >= len(snapshot):
+                        self.tcp_snapshot_values[index].setText("--")
+                        continue
+
+                    value = float(snapshot[index])
+
+                    if index < 3:
+                        self.tcp_snapshot_values[index].setText(
+                            f"{value:+.4f}"
+                        )
+                    else:
+                        self.tcp_snapshot_values[index].setText(
+                            f"{value:+.2f}°"
+                        )
 
     def _build_scenario_tab(self) -> QWidget:
-        self.scenario_panel = ScenarioPanel(
-            self.backend,
-            on_log=self.append_log,
-            on_active_changed=self._scenario_active_changed,
-            on_emergency_stop=self.motion_stop,
+        return self._placeholder(
+            "Scenario Manager · next implementation",
+            "Scenario execution will use explicit steps such as "
+            "READY → BASE MOVE → STOP → JOINT POSE → RESULT, "
+            "with Cancel / Timeout / failure logging.",
         )
-        return self.scenario_panel
-
-    def _scenario_active_changed(self, active: bool) -> None:
-        self._scenario_active = bool(active)
-        if active:
-            self._stop_cartesian_hold(cancel_motion=False)
-            self._stop_base_only()
-
-        # Manual Base and Joint/Cartesian controls cannot race a Task.
-        self.tabs.setTabEnabled(0, not active)
-        self.tabs.setTabEnabled(1, not active)
 
     def _build_diagnostics_tab(self) -> QWidget:
         tab = QWidget()
@@ -1794,8 +1597,6 @@ class MainWindow(QMainWindow):
         self,
         action: str,
     ) -> None:
-        if self._scenario_active:
-            return
         self._pressed_actions.add(action)
         self._refresh_command()
 
@@ -1829,21 +1630,11 @@ class MainWindow(QMainWindow):
     def motion_stop(self) -> None:
         """Software motion stop: base zero + active motion cancel."""
 
-        # Prevent a held Cartesian direction key from issuing another goal.
-        self._stop_cartesian_hold(cancel_motion=False)
-
         # Stop mobile base first.
         self._stop_base_only()
 
-        scenario_was_active = (
-            hasattr(self, "scenario_panel")
-            and self.scenario_panel.runner.active
-        )
-        if scenario_was_active:
-            self.scenario_panel.emergency_stop()
-
-        # A running Scenario already requests cancellation through its runner.
-        if not scenario_was_active and hasattr(self.backend, "cancel_motion"):
+        # Cancel active joint / Cartesian motion.
+        if hasattr(self.backend, "cancel_motion"):
             self.backend.cancel_motion()
 
     def _refresh_command(self) -> None:
@@ -1851,8 +1642,6 @@ class MainWindow(QMainWindow):
             return
 
         vx, vy, wz = self._calculate_command()
-        if self._scenario_active:
-            vx = vy = wz = 0.0
         snapshot = self.backend.snapshot()
 
         if (
@@ -1972,14 +1761,6 @@ class MainWindow(QMainWindow):
         self.state_value.setText(control_state_text)
 
         self._set_status_indicator(
-            self.power_state_value,
-            snapshot.power_enabled,
-        )
-        self._set_status_indicator(
-            self.servo_state_value,
-            snapshot.servo_enabled,
-        )
-        self._set_status_indicator(
             self.stream_value,
             snapshot.stream_enabled,
         )
@@ -2018,7 +1799,6 @@ class MainWindow(QMainWindow):
                 ("cartesian_action", "TCP"),
                 ("cartesian_pose", "POSE"),
                 ("cancel_control", "CANCEL"),
-                ("scenario_safety", "SAFE"),
             )
             parts = [
                 f'{label}:{"ready" if ready.get(key) else "wait"}'
@@ -2077,12 +1857,8 @@ class MainWindow(QMainWindow):
         if event_kind == event_type(
             "WindowDeactivate"
         ):
-            if watched is self:
-                # A mouse release can be missed if focus is lost while a
-                # Cartesian direction key is held.
-                self._stop_cartesian_hold()
-                if self.stop_on_focus_loss.isChecked():
-                    self._stop_base_only()
+            if (watched is self and self.stop_on_focus_loss.isChecked()):
+                self._stop_base_only()
             return False
         if (
             not self.keyboard_enable.isChecked()
@@ -2173,12 +1949,7 @@ class MainWindow(QMainWindow):
         self._closing = True
         self.command_timer.stop()
         self.status_timer.stop()
-        self.cartesian_hold_timer.stop()
-        self._cartesian_hold_command = None
         self._pressed_actions.clear()
-
-        if hasattr(self, "scenario_panel"):
-            self.scenario_panel.runner.close()
 
         try:
             self.backend.shutdown_safely(
@@ -2268,24 +2039,11 @@ class MainWindow(QMainWindow):
 
             QDoubleSpinBox,
             QComboBox,
-            QListWidget,
             QPlainTextEdit {
                 background: #171a1f;
                 border: 1px solid #4b5563;
                 border-radius: 4px;
                 padding: 3px;
-            }
-
-            QListWidget::item:selected {
-                background: #2c6e9b;
-                color: #ffffff;
-            }
-
-            QPushButton#emergencyStop {
-                background: #9b2c2c;
-                color: white;
-                font-size: 13px;
-                font-weight: 700;
             }
 
             QFrame#headerFrame {
@@ -2308,31 +2066,6 @@ class MainWindow(QMainWindow):
                 background: #414b59;
             }
 
-
-            QFrame#controlStateCard {
-                background: #1f2630;
-                border: 1px solid #607086;
-                border-radius: 6px;
-            }
-
-            QLabel#controlStateTitle {
-                color: #aeb8c4;
-                font-size: 11px;
-                font-weight: 700;
-            }
-
-            QLabel#controlStateValue {
-                font-size: 17px;
-                font-weight: 800;
-            }
-
-            QLabel#vectorSnapshot {
-                background: #171a1f;
-                border: 1px solid #4b5563;
-                border-radius: 4px;
-                padding: 4px 7px;
-                font-family: Monospace;
-            }
 
             QLabel#stateValue {
                 font-weight: 700;

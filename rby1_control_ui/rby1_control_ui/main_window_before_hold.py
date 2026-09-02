@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from typing import Dict, Set
 
-from .scenario_ui import ScenarioPanel
 from .qt_compat import (
     QAbstractSpinBox,
     QApplication,
@@ -90,7 +89,6 @@ class MainWindow(QMainWindow):
         self._pressed_actions: Set[str] = set()
         self._action_buttons: Dict[str, QPushButton] = {}
         self._closing = False
-        self._scenario_active = False
 
         self._joint_target_cache = {
             key: [0.0] * dof
@@ -101,16 +99,6 @@ class MainWindow(QMainWindow):
             for key in self.CARTESIAN_ARMS
         }
         self._latest_motion_state = {}
-
-        # Press-and-hold Cartesian direction control.
-        # Only one Cartesian hold command is active at a time because the
-        # backend intentionally allows one Joint/Cartesian motion goal at once.
-        self._cartesian_hold_command = None
-        self.cartesian_hold_timer = QTimer(self)
-        self.cartesian_hold_timer.setInterval(100)
-        self.cartesian_hold_timer.timeout.connect(
-            self._continue_cartesian_hold
-        )
 
         self.setWindowTitle("RB-Y1")
 
@@ -1226,21 +1214,16 @@ class MainWindow(QMainWindow):
         for text, axis_index, direction, row, column in direction_specs:
             button = QPushButton(text)
             button.setFixedSize(48, 28)
-
-            # Direction keys are press-and-hold controls. The small +/- buttons
-            # in the pose table remain discrete one-click jogs.
-            button.pressed.connect(
-                lambda arm_name=arm,
+            button.clicked.connect(
+                lambda checked=False,
+                arm_name=arm,
                 i=axis_index,
                 d=direction:
-                self._start_cartesian_hold(
+                self._cartesian_jog(
                     arm_name,
                     i,
                     d,
                 )
-            )
-            button.released.connect(
-                self._stop_cartesian_hold
             )
             direction_layout.addWidget(button, row, column)
 
@@ -1430,81 +1413,6 @@ class MainWindow(QMainWindow):
             return
         self._cartesian_target_cache[arm][index] = float(value)
 
-    def _start_cartesian_hold(
-        self,
-        arm: str,
-        axis_index: int,
-        direction: int,
-    ) -> None:
-        """Start press-and-hold Cartesian translation control."""
-
-        if arm not in self.CARTESIAN_ARMS:
-            return
-        if axis_index < 0 or axis_index >= 3:
-            return
-
-        if (
-            self._cartesian_hold_command is not None
-            and self._cartesian_hold_command
-            != (arm, axis_index, direction)
-            and hasattr(self.backend, "cancel_active_motion")
-        ):
-            self.backend.cancel_active_motion()
-
-        self._cartesian_hold_command = (
-            arm,
-            int(axis_index),
-            int(direction),
-        )
-
-        if not self.cartesian_hold_timer.isActive():
-            self.cartesian_hold_timer.start()
-
-        self._continue_cartesian_hold()
-
-    def _continue_cartesian_hold(self) -> None:
-        """Issue the next jog step after the previous action has finished."""
-
-        command = self._cartesian_hold_command
-        if command is None:
-            self.cartesian_hold_timer.stop()
-            return
-
-        if (
-            hasattr(self.backend, "is_motion_busy")
-            and self.backend.is_motion_busy()
-        ):
-            return
-
-        arm, axis_index, direction = command
-        self._cartesian_jog(
-            arm,
-            axis_index,
-            direction,
-        )
-
-    def _stop_cartesian_hold(
-        self,
-        *args,
-        cancel_motion: bool = True,
-    ) -> None:
-        """Stop a held direction key and cancel its current action goal."""
-
-        del args
-
-        was_active = self._cartesian_hold_command is not None
-        self._cartesian_hold_command = None
-        self.cartesian_hold_timer.stop()
-
-        # Action-level cancel stops the current arm command without using the
-        # stronger global cancel_control service.
-        if (
-            was_active
-            and cancel_motion
-            and hasattr(self.backend, "cancel_active_motion")
-        ):
-            self.backend.cancel_active_motion()
-
     def _cartesian_jog(
         self,
         arm: str,
@@ -1681,23 +1589,12 @@ class MainWindow(QMainWindow):
                     )
 
     def _build_scenario_tab(self) -> QWidget:
-        self.scenario_panel = ScenarioPanel(
-            self.backend,
-            on_log=self.append_log,
-            on_active_changed=self._scenario_active_changed,
-            on_emergency_stop=self.motion_stop,
+        return self._placeholder(
+            "Scenario Manager · next implementation",
+            "Scenario execution will use explicit steps such as "
+            "READY → BASE MOVE → STOP → JOINT POSE → RESULT, "
+            "with Cancel / Timeout / failure logging.",
         )
-        return self.scenario_panel
-
-    def _scenario_active_changed(self, active: bool) -> None:
-        self._scenario_active = bool(active)
-        if active:
-            self._stop_cartesian_hold(cancel_motion=False)
-            self._stop_base_only()
-
-        # Manual Base and Joint/Cartesian controls cannot race a Task.
-        self.tabs.setTabEnabled(0, not active)
-        self.tabs.setTabEnabled(1, not active)
 
     def _build_diagnostics_tab(self) -> QWidget:
         tab = QWidget()
@@ -1794,8 +1691,6 @@ class MainWindow(QMainWindow):
         self,
         action: str,
     ) -> None:
-        if self._scenario_active:
-            return
         self._pressed_actions.add(action)
         self._refresh_command()
 
@@ -1829,21 +1724,11 @@ class MainWindow(QMainWindow):
     def motion_stop(self) -> None:
         """Software motion stop: base zero + active motion cancel."""
 
-        # Prevent a held Cartesian direction key from issuing another goal.
-        self._stop_cartesian_hold(cancel_motion=False)
-
         # Stop mobile base first.
         self._stop_base_only()
 
-        scenario_was_active = (
-            hasattr(self, "scenario_panel")
-            and self.scenario_panel.runner.active
-        )
-        if scenario_was_active:
-            self.scenario_panel.emergency_stop()
-
-        # A running Scenario already requests cancellation through its runner.
-        if not scenario_was_active and hasattr(self.backend, "cancel_motion"):
+        # Cancel active joint / Cartesian motion.
+        if hasattr(self.backend, "cancel_motion"):
             self.backend.cancel_motion()
 
     def _refresh_command(self) -> None:
@@ -1851,8 +1736,6 @@ class MainWindow(QMainWindow):
             return
 
         vx, vy, wz = self._calculate_command()
-        if self._scenario_active:
-            vx = vy = wz = 0.0
         snapshot = self.backend.snapshot()
 
         if (
@@ -1972,14 +1855,6 @@ class MainWindow(QMainWindow):
         self.state_value.setText(control_state_text)
 
         self._set_status_indicator(
-            self.power_state_value,
-            snapshot.power_enabled,
-        )
-        self._set_status_indicator(
-            self.servo_state_value,
-            snapshot.servo_enabled,
-        )
-        self._set_status_indicator(
             self.stream_value,
             snapshot.stream_enabled,
         )
@@ -2018,7 +1893,6 @@ class MainWindow(QMainWindow):
                 ("cartesian_action", "TCP"),
                 ("cartesian_pose", "POSE"),
                 ("cancel_control", "CANCEL"),
-                ("scenario_safety", "SAFE"),
             )
             parts = [
                 f'{label}:{"ready" if ready.get(key) else "wait"}'
@@ -2077,12 +1951,8 @@ class MainWindow(QMainWindow):
         if event_kind == event_type(
             "WindowDeactivate"
         ):
-            if watched is self:
-                # A mouse release can be missed if focus is lost while a
-                # Cartesian direction key is held.
-                self._stop_cartesian_hold()
-                if self.stop_on_focus_loss.isChecked():
-                    self._stop_base_only()
+            if (watched is self and self.stop_on_focus_loss.isChecked()):
+                self._stop_base_only()
             return False
         if (
             not self.keyboard_enable.isChecked()
@@ -2173,12 +2043,7 @@ class MainWindow(QMainWindow):
         self._closing = True
         self.command_timer.stop()
         self.status_timer.stop()
-        self.cartesian_hold_timer.stop()
-        self._cartesian_hold_command = None
         self._pressed_actions.clear()
-
-        if hasattr(self, "scenario_panel"):
-            self.scenario_panel.runner.close()
 
         try:
             self.backend.shutdown_safely(
@@ -2268,24 +2133,11 @@ class MainWindow(QMainWindow):
 
             QDoubleSpinBox,
             QComboBox,
-            QListWidget,
             QPlainTextEdit {
                 background: #171a1f;
                 border: 1px solid #4b5563;
                 border-radius: 4px;
                 padding: 3px;
-            }
-
-            QListWidget::item:selected {
-                background: #2c6e9b;
-                color: #ffffff;
-            }
-
-            QPushButton#emergencyStop {
-                background: #9b2c2c;
-                color: white;
-                font-size: 13px;
-                font-weight: 700;
             }
 
             QFrame#headerFrame {

@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>rby1_control_ui</name>
-  <version>0.1.0</version>
-  <description>Reusable Qt teleoperation UI for the RB-Y1 mobile base through ROS 2 cmd_vel.</description>
+  <version>0.2.0</version>
+  <description>Qt teleoperation and IDE-authored Task UI for RB-Y1 through ROS 2.</description>
 
   <maintainer email="user@example.com">RB-Y1 UI Developer</maintainer>
   <license>Apache-2.0</license>
@@ -10,7 +10,9 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>rby1_msgs</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
