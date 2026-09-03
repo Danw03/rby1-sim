@@ -8,7 +8,7 @@ package_name = 'rby1_gripper_bridge'
 
 setup(
     name=package_name,
-    version='0.1.0',
+    version='0.2.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         (
@@ -23,7 +23,9 @@ setup(
     zip_safe=True,
     maintainer='RB-Y1 Developer',
     maintainer_email='user@example.com',
-    description='ROS 2 bridge for the RB-Y1 dual gripper Dynamixel bus.',
+    description=(
+        'ROS 2 bridge for RBY1 MuJoCo and physical dual grippers.'
+    ),
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={

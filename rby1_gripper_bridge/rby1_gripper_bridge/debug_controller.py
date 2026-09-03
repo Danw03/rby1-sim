@@ -18,13 +18,13 @@ from .debug_commands import DebugInstruction, parse_debug_command
 
 HELP = """\
 Commands (close ratio: 0.0=open, 1.0=closed):
-  home                         calibrate both grippers
+  home                         initialize (physical: full-travel homing)
   set <right> <left>           command both grippers atomically
   right <ratio>                command only the right gripper
   left <ratio>                 command only the left gripper
   open [right|left|both]       open one or both grippers
   close [right|left|both]      close one or both grippers
-  torque <on|off>              enable or disable both motor torques
+  torque <on|off>              physical Dynamixel torque control
   state                        print the latest normalized state
   help                         show this help
   quit                         exit this debug controller
@@ -126,7 +126,7 @@ class GripperDebugController(Node):
             ready = self._ready
         if not ready:
             raise ValueError(
-                'bridge is not ready; home or enable the gripper first'
+                'bridge is not ready; run home to initialize/recover it first'
             )
         message = Float64MultiArray()
         message.data = [values[0], values[1]]
@@ -146,7 +146,7 @@ class GripperDebugController(Node):
             lambda done: self._report_service_result('home', done)
         )
         self.get_logger().warning(
-            'homing requested; both grippers will traverse their full range'
+            'initialization/homing requested; keep physical grippers clear'
         )
 
     def _call_torque(self, enabled: bool) -> None:

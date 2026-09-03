@@ -14,7 +14,8 @@ def generate_launch_description():
 
     namespace = LaunchConfiguration('namespace')
     config = LaunchConfiguration('config')
-    mock_hardware = LaunchConfiguration('mock_hardware')
+    backend = LaunchConfiguration('backend')
+    robot_address = LaunchConfiguration('robot_address')
     auto_home = LaunchConfiguration('auto_home')
 
     bridge = Node(
@@ -25,8 +26,9 @@ def generate_launch_description():
         parameters=[
             config,
             {
-                'mock_hardware': ParameterValue(
-                    mock_hardware, value_type=bool
+                'backend': ParameterValue(backend, value_type=str),
+                'robot_address': ParameterValue(
+                    robot_address, value_type=str
                 ),
                 'auto_home': ParameterValue(auto_home, value_type=bool),
             },
@@ -47,14 +49,21 @@ def generate_launch_description():
             description='Path to the gripper bridge parameter YAML.',
         ),
         DeclareLaunchArgument(
-            'mock_hardware',
-            default_value='false',
-            description='Use an in-process loopback bus instead of the SDK.',
+            'backend',
+            default_value='mujoco',
+            description='Gripper backend: mujoco or dynamixel.',
+        ),
+        DeclareLaunchArgument(
+            'robot_address',
+            default_value='127.0.0.1:50051',
+            description='RBY1 MuJoCo gRPC server address.',
         ),
         DeclareLaunchArgument(
             'auto_home',
             default_value='false',
-            description='Run full-travel homing during bridge startup.',
+            description=(
+                'Run full-travel homing during Dynamixel backend startup.'
+            ),
         ),
         bridge,
     ])

@@ -1,5 +1,15 @@
 /**:
   ros__parameters:
+    # The rby1-sim repository defaults to the official MuJoCo server.
+    # Its GripperCommandService shares the robot gRPC port (50051).
+    backend: "mujoco"
+    robot_address: "127.0.0.1:50051"
+    rpc_timeout_sec: 2.0
+    mujoco_velocity_percent: 100
+    mujoco_force_percent: 50
+    initialize_grippers_on_start: true
+
+    # Parameters below are used only when backend=dynamixel.
     # Empty uses rby1_sdk.upc.GripperDeviceName (/dev/rby1_gripper).
     device_name: ""
     baud_rate: 2000000
@@ -39,7 +49,3 @@
 
     control_rate_hz: 10.0
     state_rate_hz: 10.0
-
-    # Loopback-only mode for checking ROS topics/services without hardware.
-    # This does not drive the MuJoCo gripper model.
-    mock_hardware: false

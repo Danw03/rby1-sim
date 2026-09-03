@@ -1,147 +1,232 @@
-# RB-Y1 Gripper Bridge
+# RBY1 Gripper Bridge
 
-`rby1_sdk.DynamixelBus`로 직접 연결되는 RB-Y1 양손 그리퍼를 ROS 2로
-노출하는 독립 패키지입니다. 기존 `rby1_driver`나 `rby1_control_ui`를
-수정하지 않습니다.
+RBY1 양손 그리퍼를 하나의 ROS 2 인터페이스로 노출하는 독립 패키지입니다.
+기존 `rby1_driver`, `rby1_control_ui` 등 다른 패키지는 수정하지 않습니다.
 
-이 패키지는 다음 경계를 전제로 합니다.
+두 실행 backend를 제공합니다.
+
+- `mujoco` (기본값): 공식 RBY1 MuJoCo 서버의
+  `rb.api.GripperCommandService`에 gRPC로 연결합니다. 기본 주소는
+  `127.0.0.1:50051`입니다.
+- `dynamixel`: 실물 RBY1 그리퍼의 `/dev/rby1_gripper`를
+  `rby1_sdk.DynamixelBus`로 직접 제어합니다.
 
 ```text
-control_ui / planner  ->  backend  ->  gripper/command
-                                      |
-                              rby1_gripper_bridge
-                                      |
-                       rby1_sdk.DynamixelBus
-                                      |
-                             /dev/rby1_gripper
+control_ui / planner  ->  future backend  ->  /rby1/gripper/command
+                                                |
+                                      rby1_gripper_bridge
+                                       /                \
+                     MuJoCo gRPC :50051                  Dynamixel serial
 ```
 
-그리퍼 시리얼 포트는 이 bridge 프로세스 하나만 열어야 합니다. SDK의
-teleoperation 예제처럼 같은 포트를 직접 여는 프로그램과 동시에 실행하지
-마세요.
+MuJoCo RPC가 받는 `right`/`left`의 position, velocity, force 단위는
+각각 0~100입니다. ROS에서는 backend와 무관하게 close ratio
+`0.0=open`, `1.0=closed`를 사용하고 bridge가 position percent로
+변환합니다.
 
 ## ROS interface
 
-기본 launch namespace는 `/rby1`입니다. 아래 이름은 그 namespace를 적용한
-결과입니다.
+기본 launch namespace는 `/rby1`입니다.
 
 | Kind | Name | Type | Contract |
 |---|---|---|---|
-| Subscribe | `/rby1/gripper/command` | `std_msgs/msg/Float64MultiArray` | `data=[right, left]`, 각 값은 close ratio `0.0=open`, `1.0=closed` |
-| Publish | `/rby1/gripper/state` | `std_msgs/msg/Float64MultiArray` | 측정 close ratio `[right, left]`; homing 전에는 `NaN` |
-| Publish | `/rby1/gripper/motor_state` | `sensor_msgs/msg/JointState` | Dynamixel 원시 위치(rad), 속도(rad/s) |
-| Publish | `/rby1/gripper/ready` | `std_msgs/msg/Bool` | 통신, calibration, torque가 모두 준비되었을 때 `true` |
-| Publish | `/rby1/gripper/diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | calibration, 목표, 전류, 온도 요약 |
-| Service | `/rby1/gripper/home` | `std_srvs/srv/Trigger` | 양쪽 full-travel homing 및 torque enable |
-| Service | `/rby1/gripper/torque_enable` | `std_srvs/srv/SetBool` | 양쪽 torque on/off |
+| Subscribe | `/rby1/gripper/command` | `std_msgs/msg/Float64MultiArray` | `data=[right, left]`, `0.0=open`, `1.0=closed` |
+| Publish | `/rby1/gripper/state` | `std_msgs/msg/Float64MultiArray` | `[right, left]`; 실물은 측정값, MuJoCo는 양쪽 RPC가 성공한 마지막 목표값 |
+| Publish | `/rby1/gripper/motor_state` | `sensor_msgs/msg/JointState` | 실물 Dynamixel의 위치(rad), 속도(rad/s); MuJoCo에서는 발행하지 않음 |
+| Publish | `/rby1/gripper/ready` | `std_msgs/msg/Bool` | 명령을 받을 준비가 되었는지 표시 |
+| Publish | `/rby1/gripper/diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | backend, 연결 상태, 상태 출처, 목표, 실물 전류/온도 |
+| Service | `/rby1/gripper/home` | `std_srvs/srv/Trigger` | MuJoCo는 RPC 재초기화, 실물은 full-travel homing |
+| Service | `/rby1/gripper/torque_enable` | `std_srvs/srv/SetBool` | 실물 torque on/off; MuJoCo는 disable RPC가 없어 `false` 요청을 거부 |
 
-명령은 길이 2의 유한한 값만 받고, 범위 밖 값을 clamp하지 않고 거부합니다.
-Homing 또는 저장된 calibration 없이 position command를 보내는 것도
-거부합니다. 양손을 한 메시지로 보내므로 handover처럼 동시성이 필요한
-명령에서 한쪽만 갱신되는 중간 상태가 생기지 않습니다.
+명령은 길이가 정확히 2이고 각 값이 유한한 0~1 범위일 때만 받습니다.
+양손 목표를 한 ROS 메시지로 전달하므로 상위 backend는 항상
+`[right, left]` 전체 값을 publish하면 됩니다.
+
+주의: 공식 `GripperCommandService`에는 상태 조회 RPC가 없습니다. 따라서
+MuJoCo의 `/gripper/state`는 화면에서 측정한 관절값이 아니라 서버가 오류 없이
+받은 마지막 목표값입니다. 실제 동작 여부는 MuJoCo 화면으로 확인하고,
+diagnostics의 `state_source=last_rpc_accepted_target`도 함께 확인하십시오.
 
 ## Build
 
-ROS 2를 사용하는 Python 환경에 공식 SDK를 먼저 설치합니다.
+현재 사용 중인 SDK 경로와 ROS 환경을 먼저 적용합니다.
 
 ```bash
-python3 -m pip install "rby1-sdk>=0.10.0"
+export RBY1_SDK_PATH=/root/sdk/rby1-sdk
+source /opt/ros/humble/setup.bash
+cd ~/rby1_ros2_ws
+
+# grpc import가 실패할 때만 설치
+python3 -c "import grpc; print(grpc.__version__)"
+# sudo apt install python3-grpcio
+
 colcon build --symlink-install --packages-select rby1_gripper_bridge
 source install/setup.bash
 ```
 
-## Hardware run
-
-먼저 `/dev/rby1_gripper`가 존재하고 현재 사용자에게 읽기/쓰기 권한이 있는지
-확인합니다. Bridge는 안전을 위해 기본값으로 자동 homing하지 않습니다.
-
-Terminal 1:
+전체 workspace를 다시 빌드하려면 마지막 build 명령만 다음처럼 바꿉니다.
 
 ```bash
+colcon build --symlink-install --cmake-clean-cache
+```
+
+## MuJoCo 실행 및 화면 검증
+
+연구실 PC에서 기존 MuJoCo 시뮬레이터를 먼저 띄운 뒤 50051 포트를
+확인합니다.
+
+```bash
+ss -ltn | grep ':50051'
+```
+
+Terminal 1에서 bridge를 실행합니다. `mujoco`가 기본 backend라 첫 명령은
+짧게 써도 됩니다.
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/rby1_ros2_ws/install/setup.bash
 ros2 launch rby1_gripper_bridge gripper_bridge.launch.py
 ```
 
-Terminal 2의 가벼운 interactive debug node:
+시뮬레이터가 다른 PC에 있으면 주소만 바꿉니다.
 
 ```bash
+ros2 launch rby1_gripper_bridge gripper_bridge.launch.py \
+  backend:=mujoco robot_address:=192.168.x.x:50051
+```
+
+Terminal 2에서 가벼운 interactive debug node를 실행합니다.
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/rby1_ros2_ws/install/setup.bash
 ros2 run rby1_gripper_bridge gripper_debug_controller \
   --ros-args -r __ns:=/rby1
 ```
 
-프롬프트에서 `home`을 실행하기 전에 양쪽 그리퍼의 전체 이동 경로를
-비우세요. Homing은 양 끝의 hard stop을 찾기 위해 양쪽 그리퍼를 완전히
-왕복시킵니다. 완료 후 다음 명령으로 바로 확인할 수 있습니다.
+다음 명령을 한 줄씩 입력하면 MuJoCo 화면의 양쪽 손가락이 실제로
+움직여야 합니다.
 
 ```text
 open both
 close right
 left 0.5
 set 0.25 0.75
+close both
+open both
 state
-torque off
 ```
 
-토픽만으로도 명령할 수 있습니다.
+토픽만으로도 바로 시험할 수 있습니다.
 
 ```bash
 ros2 topic pub --once /rby1/gripper/command \
   std_msgs/msg/Float64MultiArray "{data: [1.0, 0.0]}"
+
+ros2 topic echo --once /rby1/gripper/ready
+ros2 topic echo --once /rby1/gripper/diagnostics
 ```
 
-## ROS-only loopback test
-
-실기 없이 backend/topic 배선을 검증할 때는 mock 모드를 사용합니다. 이
-모드는 in-process 상태만 흉내 내며 MuJoCo gripper를 움직이지 않습니다.
-
-Terminal 1:
+연결이 끊겨 `/ready=false`가 되면 시뮬레이터와 50051 포트를 복구한 뒤
+다음 서비스로 gRPC 연결과 양쪽 그리퍼를 재초기화합니다.
 
 ```bash
-ros2 launch rby1_gripper_bridge gripper_bridge.launch.py \
-  mock_hardware:=true auto_home:=true
+ros2 service call /rby1/gripper/home std_srvs/srv/Trigger "{}"
 ```
 
-Terminal 2:
+## 실물 검증 절차
 
-```bash
-ros2 run rby1_gripper_bridge gripper_debug_controller \
-  --ros-args -r __ns:=/rby1
-```
+실물에서는 그리퍼 시리얼 포트를 이 bridge 하나만 열어야 합니다. SDK의
+teleoperation 예제나 다른 그리퍼 프로그램을 동시에 실행하지 마십시오.
 
-## Reusing calibration
+1. 비상정지 버튼을 바로 누를 수 있게 두고, 양쪽 그리퍼의 전체 이동 경로와
+   내부를 비웁니다. 처음에는 물체나 payload를 잡지 않습니다.
+2. 장치와 SDK를 확인합니다.
 
-성공한 homing 결과는 node log와 diagnostics에 `min=[right, left]`,
-`max=[right, left]`로 표시됩니다. 값을 `config/default.yaml`을 복사한 별도
-운영 설정에 넣으면 다음 startup부터 full-travel 동작을 생략할 수 있습니다.
+   ```bash
+   ls -l /dev/rby1_gripper
+   python3 -c "import rby1_sdk; print('rby1_sdk OK')"
+   ```
+
+3. Terminal 1에서 자동 homing 없이 실물 backend를 시작합니다.
+
+   ```bash
+   source /opt/ros/humble/setup.bash
+   source ~/rby1_ros2_ws/install/setup.bash
+   ros2 launch rby1_gripper_bridge gripper_bridge.launch.py \
+     backend:=dynamixel auto_home:=false
+   ```
+
+4. 다른 terminal에서 초기 상태를 확인합니다. 이 시점의 `ready=false`와
+   `Calibration required`는 정상입니다.
+
+   ```bash
+   source /opt/ros/humble/setup.bash
+   source ~/rby1_ros2_ws/install/setup.bash
+   ros2 topic echo --once /rby1/gripper/ready
+   ros2 topic echo --once /rby1/gripper/diagnostics
+   ```
+
+5. 손을 치운 상태에서 한 번만 homing합니다. 양쪽 그리퍼가 낮은 torque로
+   양 끝 hard stop을 찾기 위해 완전히 왕복합니다. 이상음, 비대칭 걸림,
+   과도한 변형이 보이면 즉시 비상정지하거나 bridge를 종료합니다.
+
+   ```bash
+   ros2 service call /rby1/gripper/home std_srvs/srv/Trigger "{}"
+   ```
+
+6. 서비스 응답의 `min=[right,left]`, `max=[right,left]`를 기록하고
+   `ready=true`인지 확인합니다. 그다음 작은 단계부터 시험합니다.
+
+   ```bash
+   ros2 topic pub --once /rby1/gripper/command \
+     std_msgs/msg/Float64MultiArray "{data: [0.0, 0.0]}"
+   ros2 topic pub --once /rby1/gripper/command \
+     std_msgs/msg/Float64MultiArray "{data: [0.1, 0.1]}"
+   ros2 topic pub --once /rby1/gripper/command \
+     std_msgs/msg/Float64MultiArray "{data: [0.25, 0.25]}"
+   ```
+
+7. `/rby1/gripper/state`가 목표를 따라가는지, diagnostics의 전류와 온도가
+   비정상적으로 증가하지 않는지 확인한 뒤에만 0.5, 0.75, 1.0으로
+   단계적으로 올립니다. 오른쪽과 왼쪽도 따로 검증합니다.
+8. 검증을 마치면 torque를 해제합니다. `Ctrl-C`로 정상 종료해도 기본 설정은
+   torque를 해제합니다.
+
+   ```bash
+   ros2 service call /rby1/gripper/torque_enable \
+     std_srvs/srv/SetBool "{data: false}"
+   ```
+
+## 실물 calibration 재사용
+
+성공한 homing 결과를 별도 운영 YAML에 저장하면 다음 실행부터 hard stop
+왕복을 생략할 수 있습니다. 아래 숫자는 형식 예시일 뿐 복사해서 사용하면
+안 됩니다.
 
 ```yaml
 /**:
   ros__parameters:
+    backend: "dynamixel"
     use_saved_calibration: true
     calibration_min_rad: [-1.23, -1.20]
     calibration_max_rad: [1.15, 1.18]
     auto_enable_torque: true
 ```
 
-Calibration 값은 예시를 복사하지 말고 반드시 해당 하드웨어에서 측정한 값을
-사용하세요.
+```bash
+ros2 launch rby1_gripper_bridge gripper_bridge.launch.py \
+  backend:=dynamixel config:=/absolute/path/to/hardware.yaml
+```
 
-## Important parameters
+`endpoint_margin_ratio`를 0보다 조금 크게 두면 실제 운용 목표가 hard stop에
+직접 닿지 않게 할 수 있습니다. 값 변경 후에는 open/close 의미와 유효
+stroke를 다시 검증하십시오.
 
-- `device_name`: 빈 문자열이면 SDK의 `GripperDeviceName`을 사용합니다.
-- `right_motor_id`, `left_motor_id`: SDK 예제와 같은 기본값 `0`, `1`입니다.
-- `closed_at_minimum`: 기본 `[true, true]`이며 SDK 예제의 방향과 같습니다.
-- `position_torque_limit`: 기본 `5.0`; upstream SDK 예제 값이지만 실제
-  그리퍼와 payload에 맞게 검증해야 합니다.
-- `homing_torque`: 기본 `0.3`.
-- `endpoint_margin_ratio`: 양 끝 hard stop을 피할 운영 margin이며 기본은 SDK
-  동작과 같은 `0.0`입니다.
-- `disable_torque_on_shutdown`: 정상 종료 시 torque를 해제하며 기본
-  `true`입니다.
+## 향후 backend 패키지 연결
 
-## Backend integration note
-
-토픽 명령 자체는 fire-and-forget입니다. 이후 backend는 command를 publish한
-뒤 `/rby1/gripper/state`가 목표 tolerance 안에 들어오는지, `/ready`가 계속
-true인지, timeout이 지나지 않았는지를 확인한 다음 planner에 성공/실패를
-반환해야 합니다. 이 완료 판정과 task sequencing은 hardware bridge가 아니라
-backend의 책임으로 남겨 두었습니다.
+향후 분리할 backend 노드는 `/rby1/gripper/command`를 publish하고,
+`/rby1/gripper/ready`, `/rby1/gripper/state`, diagnostics를 확인해 timeout과
+완료 여부를 planner에 반환하면 됩니다. MuJoCo state는 accepted target이므로
+시뮬레이션 단계에서는 시간 제한과 화면/작업 결과를 함께 사용하고, 실물
+단계에서는 측정 state tolerance로 완료를 판정하는 것이 안전합니다.

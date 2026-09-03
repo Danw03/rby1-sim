@@ -27,7 +27,7 @@ class GripperConfigurationError(GripperError):
 
 
 class GripperHardwareError(GripperError):
-    """Raised when the Dynamixel bus does not return usable data."""
+    """Raised when a gripper backend does not return usable data."""
 
 
 class GripperNotReadyError(GripperError):
