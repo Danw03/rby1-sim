@@ -18,13 +18,13 @@ from .debug_commands import DebugInstruction, parse_debug_command
 
 HELP = """\
 Commands (close ratio: 0.0=open, 1.0=closed):
-  home                         initialize (physical: full-travel homing)
+  home                         run full-travel hardware homing
   set <right> <left>           command both grippers atomically
   right <ratio>                command only the right gripper
   left <ratio>                 command only the left gripper
   open [right|left|both]       open one or both grippers
   close [right|left|both]      close one or both grippers
-  torque <on|off>              physical Dynamixel torque control
+  torque <on|off>              Dynamixel torque control
   state                        print the latest normalized state
   help                         show this help
   quit                         exit this debug controller
@@ -57,7 +57,7 @@ class GripperDebugController(Node):
         self._lock = threading.Lock()
         self._latest_state: Optional[Tuple[float, float]] = None
         self._last_command: Optional[Tuple[float, float]] = None
-        self._ready = False
+        self._ready: Optional[bool] = None
 
     def _on_state(self, message: Float64MultiArray) -> None:
         if len(message.data) != 2:
@@ -70,7 +70,7 @@ class GripperDebugController(Node):
 
     def _on_ready(self, message: Bool) -> None:
         with self._lock:
-            changed = bool(message.data) != self._ready
+            changed = self._ready is None or bool(message.data) != self._ready
             self._ready = bool(message.data)
         if changed:
             self.get_logger().info(f'bridge ready={self._ready}')
@@ -124,9 +124,15 @@ class GripperDebugController(Node):
     def _publish_command(self, values: Tuple[float, float]) -> None:
         with self._lock:
             ready = self._ready
-        if not ready:
+        if ready is None:
             raise ValueError(
-                'bridge is not ready; run home to initialize/recover it first'
+                'no ready message received; check the /rby1 namespace and '
+                'whether gripper_bridge is running'
+            )
+        if ready is False:
+            raise ValueError(
+                'bridge is not ready; inspect diagnostics and run home if '
+                'calibration is required'
             )
         message = Float64MultiArray()
         message.data = [values[0], values[1]]
@@ -146,7 +152,7 @@ class GripperDebugController(Node):
             lambda done: self._report_service_result('home', done)
         )
         self.get_logger().warning(
-            'initialization/homing requested; keep physical grippers clear'
+            'full-travel homing requested; keep both grippers clear'
         )
 
     def _call_torque(self, enabled: bool) -> None:
@@ -176,11 +182,18 @@ class GripperDebugController(Node):
         with self._lock:
             state = self._latest_state
             ready = self._ready
+        ready_text = (
+            'unknown (no ready message received)'
+            if ready is None
+            else str(ready)
+        )
         if state is None:
-            self.get_logger().info(f'bridge ready={ready}; state unavailable')
+            self.get_logger().info(
+                f'bridge ready={ready_text}; state unavailable'
+            )
         else:
             self.get_logger().info(
-                f'bridge ready={ready}; close ratios '
+                f'bridge ready={ready_text}; measured close ratios '
                 f'[right, left]={list(state)}'
             )
 

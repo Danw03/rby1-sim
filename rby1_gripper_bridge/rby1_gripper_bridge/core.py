@@ -27,7 +27,7 @@ class GripperConfigurationError(GripperError):
 
 
 class GripperHardwareError(GripperError):
-    """Raised when a gripper backend does not return usable data."""
+    """Raised when the Dynamixel gripper does not return usable data."""
 
 
 class GripperNotReadyError(GripperError):
@@ -299,7 +299,7 @@ class GripperDriver:
         self,
         *,
         homing_torque: float = 0.3,
-        sample_period_sec: float = 0.1,
+        sample_period_sec: float = 0.05,
         stall_threshold_rad: float = 0.002,
         stall_samples: int = 10,
         direction_timeout_sec: float = 10.0,
