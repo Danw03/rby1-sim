@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'control_ui = rby1_control_ui.main:main',
+            'control_backend = rby1_control_ui.backend_main:main',
         ],
     },
 )

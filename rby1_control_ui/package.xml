@@ -2,7 +2,7 @@
 <package format="3">
   <name>rby1_control_ui</name>
   <version>0.2.0</version>
-  <description>Qt teleoperation and IDE-authored Task UI for RB-Y1 through ROS 2.</description>
+  <description>Qt frontend and topic-command backend for RB-Y1 through ROS 2.</description>
 
   <maintainer email="user@example.com">RB-Y1 UI Developer</maintainer>
   <license>Apache-2.0</license>

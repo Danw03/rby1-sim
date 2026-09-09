@@ -34,6 +34,7 @@ class CommandKind(str, Enum):
     JOINT_RELATIVE = "joint_relative"
     LINEAR_ABSOLUTE = "linear_absolute"
     LINEAR_RELATIVE = "linear_relative"
+    BASE_VELOCITY = "base_velocity"
     DELAY = "delay"
 
 
@@ -105,7 +106,33 @@ class TaskCommand:
             ):
                 raise ValueError("delay cannot contain a motion target")
             return
+        
+        if self.kind is CommandKind.BASE_VELOCITY:
+            if self.group != "base":
+                raise ValueError("base velocity command group must be 'base'")
 
+            _values(self.values, 3, "base velocity")
+            _number(self.seconds, "seconds", positive=True)
+
+            if self.joint_targets:
+                raise ValueError(
+                    "base velocity command cannot contain joint targets"
+            )
+
+            if any(value is not None for value in (
+                self.minimum_time,
+                self.velocity_limit,
+                self.acceleration_limit,
+                self.linear_velocity,
+                self.angular_velocity,
+                self.acceleration_scaling,
+            )):
+                raise ValueError(
+                    "base velocity command contains incompatible fields"
+                )
+
+            return
+        
         if (
             self.kind is not CommandKind.JOINT_ABSOLUTE_MULTI
             and self.group is None
@@ -401,7 +428,26 @@ class Task:
             ),
         ))
         return self
+    def base_velocity(
+            self,
+            vx: float,
+            vy: float,
+            wz: float,
+            seconds: float,
+    ) -> "Task":
+        self.task_list.append(TaskCommand(
+            kind=CommandKind.BASE_VELOCITY,
+            group="base",
+            values=(
+                _number(vx, "vx"),
+                _number(vy, "vy"),
+                _number(wz, "wz"),
+            ),
+            seconds=_number(seconds, "seconds", positive=True),
+        ))
 
+        return self
+        
     def delay(self, milliseconds: float) -> "Task":
         seconds = _number(milliseconds, "milliseconds", positive=True) / 1000.0
         self.task_list.append(TaskCommand(kind=CommandKind.DELAY, seconds=seconds))

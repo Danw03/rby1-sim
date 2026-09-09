@@ -1685,7 +1685,6 @@ class MainWindow(QMainWindow):
             self.backend,
             on_log=self.append_log,
             on_active_changed=self._scenario_active_changed,
-            on_emergency_stop=self.motion_stop,
         )
         return self.scenario_panel
 
@@ -1847,12 +1846,11 @@ class MainWindow(QMainWindow):
             self.backend.cancel_motion()
 
     def _refresh_command(self) -> None:
-        if self._closing:
+        if self._closing or self._scenario_active:
             return
 
         vx, vy, wz = self._calculate_command()
-        if self._scenario_active:
-            vx = vy = wz = 0.0
+    
         snapshot = self.backend.snapshot()
 
         if (

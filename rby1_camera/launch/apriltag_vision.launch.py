@@ -3,6 +3,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
+
 def generate_launch_description():
     # 방금 만든 apriltag.yaml 파일의 위치를 찾습니다.
     config_file = os.path.join(

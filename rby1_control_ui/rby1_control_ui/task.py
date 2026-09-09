@@ -7,6 +7,9 @@ from __future__ import annotations
 
 from .task_commands import Task, list_sum
 
+# --------------------------------------------------------------------------------------------
+# 기본 pose들
+# --------------------------------------------------------------------------------------------
 
 def stand_pose() -> Task:
     """Move torso and both arms together to a standing up posture."""
@@ -50,10 +53,32 @@ def object_gripping_initial_pose() -> Task:
         torso=[0.059126, 45.376237, -90.963053, 45.154560, 0.021390, -0.000280,],
         right_arm=[-34.913810, -63.837794, 46.172754, -106.640370, 16.002640, 45.214678, 83.061208,],
         left_arm=[-33.643824, 63.218668, -44.626985, -106.563932, -17.501234, 44.556740, -84.095907],
-        joint_motion=joint_motion,
+        joint_motion=joint_motion
     )
     return task
 
+# --------------------------------------------------------------------------------------------
+# 움직임 관련 task들
+# --------------------------------------------------------------------------------------------
+
+def torso_rotation() -> Task:
+    task = Task("torso_rotation")
+
+    task.joint_absolute(
+        "torso", [0.065071, 45.375357, -90.960025, 45.153579, 0.027261, -90.0],  # 6개, deg
+        [4.0, 1.0, 1.0],
+    )
+
+    return task
+def base_forward_example() -> Task:
+    task = Task("base_forward_example")
+    task.base_velocity(vx = 0.20, vy = 0.0, wz = 0.0, seconds=3.0)
+    return task
+
+def base_sideways_example() -> Task:
+    task = Task("base_sideways_example")
+    task.base_velocity(vx = 0.0, vy = -0.15, wz = 0.0, seconds=4.0)
+    return task
 
 def right_tcp_example() -> Task:
 
@@ -78,18 +103,6 @@ def right_joint_example() -> Task:
     joint_motion = [10.0, 0.20, 0.20]
     task.joint_absolute("right_arm", q, joint_motion)
     return task
-
-
-def combined_example() -> Task:
-    """Example of joining Tasks in the same style as KR's extend."""
-
-    task = Task("combined_example")
-    task.extend(right_tcp_example())
-    task.extend(right_joint_example())
-    task.extend(ready_pose())
-    return task
-
-
 
 def object_handover_demo() -> Task:
     """Pick with the right hand and hand the object to the left hand."""
@@ -144,9 +157,10 @@ def object_handover_demo() -> Task:
     task.linear_absolute("left_arm", left_handover_tcp, tcp_motion)
     task.delay(750)  # Placeholder: close the left gripper.
     task.delay(750)  # Placeholder: open the right gripper.
-
+    task.extend(base_sideways_example())
     # Return the left arm to its ready pose, lower it, and assume release.
     task.joint_absolute("left_arm", ready_left_arm, ready_joint_motion)
+    
     task.linear_absolute(
         "left_arm",
         list_sum(ready_left_tcp, [0.0, 0.0, -pickup_distance, 0.0, 0.0, 0.0]),
@@ -155,6 +169,38 @@ def object_handover_demo() -> Task:
     task.delay(750)  # Placeholder: open the left gripper.
     return task
 
+def object_handover_demo2() -> Task:
+    """Pick with the right hand, rotate torso and place the object down."""
+    task = Task("object_handover_demo2",)
+    task.extend(object_gripping_initial_pose())
+    # 값 설정
+    tcp_motion = [1.0, 4.00, 4.00, 1.00]
+    pickup_distance = 0.10
+
+    ready_right_tcp = [0.374015, -0.243156, 0.920902, 0.004552, -0.023684, 89.899989]
+    # Right hand: descend, assume grasp, lift, face left, and move to center.
+    task.linear_absolute(
+        "right_arm", list_sum(ready_right_tcp, [0.0, 0.0, -pickup_distance, 0.0, 0.0, 0.0]), tcp_motion,
+    )
+    task.delay(750)  # Placeholder: close the right gripper.
+    task.linear_absolute("right_arm", ready_right_tcp, tcp_motion)
+    task.extend(torso_rotation())
+    task.linear_relative(
+            "right_arm", [0.0, 0.0, -pickup_distance, 0.0, 0.0, 0.0], tcp_motion,
+        )
+    task.delay(750)  # Placeholder: close the right gripper.
+    task.linear_relative("right_arm", [0.0, 0.0, pickup_distance, 0.0, 0.0, 0.0], tcp_motion)
+    
+    return task
+
+def combined_example() -> Task:
+    """Example of joining Tasks in the same style as KR's extend."""
+
+    task = Task("combined_example")
+    task.extend(right_tcp_example())
+    task.extend(right_joint_example())
+    task.extend(ready_pose())
+    return task
 # --------------------------------------------------------------------------------------------
 
 def build_tasks() -> dict[str, Task]:
@@ -168,6 +214,10 @@ def build_tasks() -> dict[str, Task]:
         "combined_example": combined_example(),
         "object_gripping_initial_pose": object_gripping_initial_pose(),
         "object_handover_demo": object_handover_demo(),
+        "base_forward_example": base_forward_example(),
+        "base_sideways_example": base_sideways_example(),
+        "torso_rotation": torso_rotation(),
+        "object_handover_demo2": object_handover_demo2(),
     }
 
 

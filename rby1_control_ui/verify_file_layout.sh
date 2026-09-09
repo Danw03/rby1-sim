@@ -12,6 +12,10 @@ required=(
   rby1_control_ui/__init__.py
   rby1_control_ui/qt_compat.py
   rby1_control_ui/backend_contract.py
+  rby1_control_ui/topic_protocol.py
+  rby1_control_ui/topic_backend.py
+  rby1_control_ui/frontend_node.py
+  rby1_control_ui/backend_main.py
   rby1_control_ui/ros_backend.py
   rby1_control_ui/mock_backend.py
   rby1_control_ui/task_commands.py

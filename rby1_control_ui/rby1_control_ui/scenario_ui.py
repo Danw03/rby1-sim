@@ -32,14 +32,12 @@ class ScenarioPanel(QWidget):
         *,
         on_log: Callable[[str, str], None],
         on_active_changed: Callable[[bool], None],
-        on_emergency_stop: Callable[[], None],
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.backend = backend
         self.on_log = on_log
         self.on_active_changed = on_active_changed
-        self.on_emergency_stop = on_emergency_stop
         self.tasks: Dict[str, TaskDefinition] = {}
         self.runner = TaskRunner(
             backend,
@@ -81,10 +79,9 @@ class ScenarioPanel(QWidget):
         self.run_button.clicked.connect(self.run_selected)
         tasks_layout.addWidget(self.run_button)
 
-        self.emergency_button = QPushButton("EMERGENCY STOP")
-        self.emergency_button.setObjectName("emergencyStop")
-        self.emergency_button.clicked.connect(self.on_emergency_stop)
-        tasks_layout.addWidget(self.emergency_button)
+        self.cancel_button = QPushButton("CANCEL")
+        self.cancel_button.clicked.connect(self.backend.cancel_motion)
+        tasks_layout.addWidget(self.cancel_button)
         root.addWidget(tasks_group, 2)
 
         details = QWidget()

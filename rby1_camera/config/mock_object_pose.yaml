@@ -1,0 +1,16 @@
+/**:
+  ros__parameters:
+    # Relative topic resolves to /rby1/perception/object_pose with the default
+    # launch namespace.
+    object_pose_topic: perception/object_pose
+
+    # One stable simulated detection. These coordinates validate the transport
+    # interface only; they are not a universally safe robot motion target.
+    object_id: tag_0
+    frame_id: base
+    position: [0.45, -0.20, 0.85]
+    orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+    confidence: 1.0
+
+    publish_rate_hz: 10.0
+    enabled: true
