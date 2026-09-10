@@ -120,24 +120,19 @@ JOINT_MAX_ACCELERATION_RAD = {
     'head': (None, None),
 }
 
-DRIVER_SAFETY_CONTRACT = (
-    'rby1_scenario_safety_v2;'
-    'joint_path=sampled_0.05rad;'
-    'cartesian_execution=sdk_builder;'
-    'cartesian_strict_path=optional_ik_0.005m_0.087rad;'
-    'runtime_collision_cancel=true;'
-    'runtime_joint_limit_cancel=true'
-)
+ROBOT_STATE_MAX_AGE_SEC = 1.0
+MANIPULATOR_STATE_MAX_AGE_SEC = 1.0
+CONTROL_MANAGER_FAULT_STATES = (4, 5)
 
 TASK_CARTESIAN_STOP_POSITION_ERROR_M = 5e-3
 TASK_CARTESIAN_STOP_ORIENTATION_ERROR_RAD = 1e-2
 
 
 class Rby1ControlNode(Node):
-    """ROS node used by the Qt interface."""
+    """Robot-facing ROS backend used by the topic transport node."""
 
-    def __init__(self) -> None:
-        super().__init__('rby1_control_ui', namespace='rby1')
+    def __init__(self, node_name: str = 'rby1_control_backend') -> None:
+        super().__init__(str(node_name), namespace='rby1')
 
         # ROS topic and service names.
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
@@ -173,11 +168,6 @@ class Rby1ControlNode(Node):
             'cancel_control_service',
             'cancel_control',
         )
-        self.declare_parameter(
-            'scenario_safety_capabilities_service',
-            'scenario_safety_capabilities',
-        )
-
         self.declare_parameter(
             'right_arm_joint_state_topic',
             'joint_states/right_arm',
@@ -290,12 +280,6 @@ class Rby1ControlNode(Node):
         self.cancel_control_service = str(
             self.get_parameter('cancel_control_service').value
         )
-        self.scenario_safety_capabilities_service = str(
-            self.get_parameter(
-                'scenario_safety_capabilities_service'
-            ).value
-        )
-
         self.joint_state_topics = {
             'right_arm': str(
                 self.get_parameter(
@@ -510,9 +494,7 @@ class Rby1ControlNode(Node):
         self._active_task_command_id: Optional[str] = None
         self._task_command_sequence = 0
         self._task_commands: Dict[str, TaskCommandState] = {}
-        self._driver_safety_verified = False
-        self._driver_safety_updated_at: Optional[float] = None
-        self._driver_safety_request_pending = False
+        self._runtime_safety_stop_latched = False
 
         # Action-level cancellation state for press-and-hold Cartesian jogging.
         self._cancel_motion_on_accept = False
@@ -560,7 +542,6 @@ class Rby1ControlNode(Node):
         self.cartesian_action_client = None
         self.cartesian_pose_client = None
         self.cancel_control_client = None
-        self.scenario_safety_capabilities_client = None
         self.joint_state_subs = []
 
         if self.services_enabled:
@@ -607,11 +588,6 @@ class Rby1ControlNode(Node):
                 Trigger,
                 self.cancel_control_service,
             )
-            self.scenario_safety_capabilities_client = self.create_client(
-                Trigger,
-                self.scenario_safety_capabilities_service,
-            )
-
             self.joint_action_client = ActionClient(
                 self,
                 Rby1JointCommand,
@@ -661,9 +637,9 @@ class Rby1ControlNode(Node):
             self.cartesian_state_period_sec,
             self._poll_cartesian_state,
         )
-        self.driver_safety_timer = self.create_timer(
-            1.0,
-            self._poll_driver_safety_capabilities,
+        self.motion_safety_timer = self.create_timer(
+            0.1,
+            self._enforce_runtime_motion_safety,
         )
 
         self._push_event(
@@ -760,6 +736,7 @@ class Rby1ControlNode(Node):
         new_stream_enabled = bool(msg.robot_stream_state)
         new_emo_active = bool(msg.emo_state)
         new_collision_active = bool(msg.collision)
+        safety_stop_reason: Optional[str] = None
 
         if new_control_state != self.control_state:
             self.control_state = new_control_state
@@ -769,6 +746,11 @@ class Rby1ControlNode(Node):
                 f'Robot control state changed to '
                 f'{new_control_state}.',
             )
+            if new_control_state in CONTROL_MANAGER_FAULT_STATES:
+                safety_stop_reason = (
+                    f'Control Manager entered fault state '
+                    f'{new_control_state}'
+                )
 
         if new_stream_enabled != self.stream_enabled:
             self.stream_enabled = new_stream_enabled
@@ -789,8 +771,7 @@ class Rby1ControlNode(Node):
             )
 
             if new_emo_active:
-                self.stop(publish_immediately=True)
-                self.cancel_motion()
+                safety_stop_reason = 'EMO became active'
 
         if new_collision_active != self.collision_active:
             self.collision_active = new_collision_active
@@ -802,8 +783,22 @@ class Rby1ControlNode(Node):
             )
 
             if new_collision_active:
-                self.stop(publish_immediately=True)
-                self.cancel_motion()
+                safety_stop_reason = 'collision state became active'
+
+        if safety_stop_reason is not None:
+            self._runtime_safety_stop_latched = True
+            self._push_event(
+                'error',
+                f'Safety stop: {safety_stop_reason}.',
+            )
+            self.stop(publish_immediately=True)
+            self.cancel_motion()
+        elif (
+            new_control_state in (2, 3)
+            and not new_emo_active
+            and not new_collision_active
+        ):
+            self._runtime_safety_stop_latched = False
 
     def _joint_state_callback(
         self,
@@ -971,76 +966,6 @@ class Rby1ControlNode(Node):
             self._cartesian_state[arm] = pose
             self._cartesian_quaternion_state[arm] = quaternion
             self._cartesian_updated_at[arm] = time.monotonic()
-
-    def _poll_driver_safety_capabilities(self) -> None:
-        client = self.scenario_safety_capabilities_client
-        if (
-            not self.services_enabled
-            or client is None
-            or not client.service_is_ready()
-        ):
-            with self._lock:
-                self._driver_safety_verified = False
-                self._driver_safety_updated_at = None
-            return
-
-        with self._lock:
-            if self._driver_safety_request_pending:
-                return
-            self._driver_safety_request_pending = True
-
-        try:
-            future = client.call_async(Trigger.Request())
-        except Exception as exc:
-            with self._lock:
-                self._driver_safety_request_pending = False
-                self._driver_safety_verified = False
-                self._driver_safety_updated_at = None
-            self._push_event(
-                'warning',
-                f'Driver safety request failed: {exc}',
-            )
-            return
-
-        self._pending_futures.append(future)
-        future.add_done_callback(
-            self._driver_safety_capabilities_done
-        )
-
-    def _driver_safety_capabilities_done(self, future) -> None:
-        self._discard_future(future)
-        with self._lock:
-            self._driver_safety_request_pending = False
-
-        try:
-            response = future.result()
-        except Exception as exc:
-            with self._lock:
-                self._driver_safety_verified = False
-                self._driver_safety_updated_at = None
-            self._push_event(
-                'warning',
-                f'Driver safety proof failed: {exc}',
-            )
-            return
-
-        verified = bool(
-            response is not None
-            and response.success is True
-            and response.message == DRIVER_SAFETY_CONTRACT
-        )
-        with self._lock:
-            recovered = verified and not self._driver_safety_verified
-            self._driver_safety_verified = verified
-            self._driver_safety_updated_at = (
-                time.monotonic() if verified else None
-            )
-
-        if recovered:
-            self._push_event(
-                'info',
-                'Driver Scenario safety contract verified.',
-            )
 
     def _cartesian_snapshot_done(
         self,
@@ -1288,6 +1213,113 @@ class Rby1ControlNode(Node):
 
         return list(values)
 
+    @staticmethod
+    def _timestamp_is_fresh(
+        updated_at: Optional[float],
+        *,
+        now: Optional[float] = None,
+        maximum_age: float = ROBOT_STATE_MAX_AGE_SEC,
+    ) -> bool:
+        if updated_at is None:
+            return False
+        captured_at = time.monotonic() if now is None else float(now)
+        age = captured_at - float(updated_at)
+        return math.isfinite(age) and 0.0 <= age <= maximum_age
+
+    def _live_motion_safety_reason(
+        self,
+        *,
+        now: Optional[float] = None,
+    ) -> Optional[str]:
+        """Return why live robot state is unsafe, or ``None`` if clear."""
+
+        captured_at = time.monotonic() if now is None else float(now)
+        with self._lock:
+            updated_at = self._robot_state_updated_at
+            emo_active = self.emo_active
+            collision_active = self.collision_active
+            control_state = self.control_state
+
+        if not self._timestamp_is_fresh(updated_at, now=captured_at):
+            return 'robot state is unavailable or stale'
+        if emo_active is not False:
+            return 'EMO state is active or unknown'
+        if collision_active is not False:
+            return 'collision state is active or unknown'
+        if control_state not in (2, 3):
+            return 'Control Manager is not ENABLE/EXECUTING'
+        return None
+
+    def _joint_feedback_ready(self, group: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            values = self._joint_groups_deg.get(group)
+            updated_at = self._joint_updated_at.get(group)
+            order_verified = self._joint_order_verified.get(group, False)
+        if (
+            values is None
+            or not order_verified
+            or not self._timestamp_is_fresh(
+                updated_at,
+                now=now,
+                maximum_age=MANIPULATOR_STATE_MAX_AGE_SEC,
+            )
+        ):
+            self._push_event(
+                'error',
+                f'Motion rejected: {group} Joint state is unavailable, '
+                'stale, or not name-ordered.',
+            )
+            return False
+        return True
+
+    def _cartesian_feedback_ready(self, arm: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            values = self._cartesian_state.get(arm)
+            updated_at = self._cartesian_updated_at.get(arm)
+        if (
+            values is None
+            or not self._timestamp_is_fresh(
+                updated_at,
+                now=now,
+                maximum_age=MANIPULATOR_STATE_MAX_AGE_SEC,
+            )
+        ):
+            self._push_event(
+                'error',
+                f'Motion rejected: {arm} Cartesian state is unavailable '
+                'or stale.',
+            )
+            return False
+        return True
+
+    def _enforce_runtime_motion_safety(self) -> None:
+        """Stop UI-owned motion if live safety feedback is lost or unsafe."""
+
+        if not self.services_enabled:
+            return
+
+        command, command_stale = self._current_command()
+        with self._lock:
+            motion_active = bool(self._motion_busy)
+        base_active = not command.stopped and not command_stale
+
+        if not motion_active and not base_active:
+            return
+
+        reason = self._live_motion_safety_reason()
+        if reason is None:
+            self._runtime_safety_stop_latched = False
+            return
+        if self._runtime_safety_stop_latched:
+            return
+
+        self._runtime_safety_stop_latched = True
+        self._push_event('error', f'Runtime safety stop: {reason}.')
+        self.stop(publish_immediately=True)
+        self.cancel_motion()
+
     def _motion_command_allowed(self) -> bool:
         """Common safety gate before sending a manipulation goal."""
 
@@ -1298,25 +1330,11 @@ class Rby1ControlNode(Node):
             )
             return False
 
-        if self.emo_active is True:
+        safety_reason = self._live_motion_safety_reason()
+        if safety_reason is not None:
             self._push_event(
                 'error',
-                'Motion rejected: EMO is active.',
-            )
-            return False
-
-        if self.collision_active is True:
-            self._push_event(
-                'error',
-                'Motion rejected: collision state is active.',
-            )
-            return False
-
-        if self.control_state not in (2, 3):
-            self._push_event(
-                'warning',
-                'Motion rejected: robot control state '
-                'is not ENABLE/EXECUTING.',
+                f'Motion rejected: {safety_reason}.',
             )
             return False
 
@@ -1367,11 +1385,12 @@ class Rby1ControlNode(Node):
             current_copy,
             self.joint_jog_minimum_time_sec,
         )
+
     def _validate_joint_targets(
-    self,
-    group: str,
-    targets_deg: List[float],
-) -> bool:
+        self,
+        group: str,
+        targets_deg: List[float],
+    ) -> bool:
         """Check requested joint targets against RB-Y1 M v1.3 limits."""
 
         limits = JOINT_LIMITS_RAD.get(group)
@@ -1390,8 +1409,23 @@ class Rby1ControlNode(Node):
             )
             return False
 
+        try:
+            numeric_targets = [float(value) for value in targets_deg]
+        except (TypeError, ValueError):
+            self._push_event(
+                "error",
+                f"{group} target contains a non-numeric value.",
+            )
+            return False
+        if not all(math.isfinite(value) for value in numeric_targets):
+            self._push_event(
+                "error",
+                f"{group} target contains a non-finite value.",
+            )
+            return False
+
         for index, (target_deg, limit) in enumerate(
-            zip(targets_deg, limits)
+            zip(numeric_targets, limits)
         ):
             lower_rad, upper_rad = limit
             target_rad = math.radians(float(target_deg))
@@ -1452,15 +1486,24 @@ class Rby1ControlNode(Node):
             )
             return
 
-        values_deg = [
-            float(value)
-            for value in targets_deg
-        ]
-
-        if not all(math.isfinite(v) for v in values_deg):
+        try:
+            values_deg = [float(value) for value in targets_deg]
+            minimum_time_value = float(minimum_time)
+        except (TypeError, ValueError):
             self._push_event(
                 'error',
-                'Non-finite joint target rejected.',
+                'Non-numeric Joint command value rejected.',
+            )
+            return
+
+        if (
+            not all(math.isfinite(v) for v in values_deg)
+            or not math.isfinite(minimum_time_value)
+            or minimum_time_value <= 0.0
+        ):
+            self._push_event(
+                'error',
+                'Non-finite Joint target or invalid minimum time rejected.',
             )
             return
 
@@ -1471,6 +1514,8 @@ class Rby1ControlNode(Node):
             return
 
         if not self._motion_command_allowed():
+            return
+        if not self._joint_feedback_ready(group):
             return
 
         if (
@@ -1499,7 +1544,7 @@ class Rby1ControlNode(Node):
         ]
         command.minimum_time = max(
             0.1,
-            float(minimum_time),
+            minimum_time_value,
         )
         command.velocity_limit = self.manual_joint_velocity_limit
         command.acceleration_limit = self.manual_joint_acceleration_limit
@@ -1650,7 +1695,14 @@ class Rby1ControlNode(Node):
             )
             return
 
-        values = [float(value) for value in target]
+        try:
+            values = [float(value) for value in target]
+        except (TypeError, ValueError):
+            self._push_event(
+                'error',
+                'Non-numeric Cartesian target rejected.',
+            )
+            return
 
         if not all(math.isfinite(v) for v in values):
             self._push_event(
@@ -1700,12 +1752,25 @@ class Rby1ControlNode(Node):
             )
             return
 
-        position = [float(value) for value in translation]
-
-        if not all(math.isfinite(value) for value in position):
+        try:
+            position = [float(value) for value in translation]
+            minimum_time_value = float(minimum_time)
+        except (TypeError, ValueError):
             self._push_event(
                 'error',
-                'Non-finite Cartesian translation rejected.',
+                'Non-numeric Cartesian command value rejected.',
+            )
+            return
+
+        if (
+            not all(math.isfinite(value) for value in position)
+            or not math.isfinite(minimum_time_value)
+            or minimum_time_value <= 0.0
+        ):
+            self._push_event(
+                'error',
+                'Non-finite Cartesian target or invalid minimum time '
+                'rejected.',
             )
             return
 
@@ -1719,6 +1784,8 @@ class Rby1ControlNode(Node):
             return
 
         if not self._motion_command_allowed():
+            return
+        if not self._cartesian_feedback_ready(arm):
             return
 
         if (
@@ -1779,7 +1846,7 @@ class Rby1ControlNode(Node):
 
         command.minimum_time = max(
             0.1,
-            float(minimum_time),
+            minimum_time_value,
         )
         command.linear_velocity_limit = (
             self.manual_cartesian_linear_velocity_limit
@@ -1811,6 +1878,7 @@ class Rby1ControlNode(Node):
                 captured_at=now,
                 robot_state_updated_at=self._robot_state_updated_at,
                 control_state=self.control_state,
+                stream_enabled=self.stream_enabled,
                 emo_active=self.emo_active,
                 collision_active=self.collision_active,
                 motion_active=bool(self._motion_busy),
@@ -1825,8 +1893,10 @@ class Rby1ControlNode(Node):
                     for arm, values in self._cartesian_state.items()
                 },
                 cartesian_updated_at=dict(self._cartesian_updated_at),
-                driver_safety_verified=self._driver_safety_verified,
-                driver_safety_updated_at=self._driver_safety_updated_at,
+                # Compatibility fields retained in the shared contract. The
+                # restored stock driver exposes no Scenario capability service.
+                driver_safety_verified=False,
+                driver_safety_updated_at=None,
             )
 
     def start_task_command(self, command: TaskCommand) -> str:
@@ -1871,6 +1941,10 @@ class Rby1ControlNode(Node):
             goal = Rby1JointCommand.Goal()
             group_labels = []
             for group, target_values in joint_targets:
+                if not self._joint_feedback_ready(group):
+                    raise RuntimeError(
+                        f'fresh, name-ordered {group} Joint state is required'
+                    )
                 values_deg = list(target_values)
                 if not self._validate_joint_targets(group, values_deg):
                     self._task_commands[command_id] = TaskCommandState(
@@ -1930,6 +2004,10 @@ class Rby1ControlNode(Node):
             arm = str(command.group)
             if arm not in self.cartesian_links:
                 raise ValueError(f'unknown Cartesian arm: {arm}')
+            if not self._cartesian_feedback_ready(arm):
+                raise RuntimeError(
+                    f'fresh {arm} Cartesian state is required'
+                )
             if (
                 self.cartesian_action_client is None
                 or Rby1CartesianCommand is None
@@ -2924,10 +3002,6 @@ class Rby1ControlNode(Node):
             'cancel_control': bool(
                 self.cancel_control_client
                 and self.cancel_control_client.service_is_ready()
-            ),
-            'scenario_safety': bool(
-                self.scenario_safety_capabilities_client
-                and self.scenario_safety_capabilities_client.service_is_ready()
             ),
             'joint_action': bool(
                 self.joint_action_client

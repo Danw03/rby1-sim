@@ -1,8 +1,64 @@
 # RB-Y1 Control UI and IDE-authored Tasks
 
-A separate Qt window for operating the RB-Y1 MuJoCo robot through ROS 2. It
-supports the mobile base, manual joint/TCP moves, and a small Scenario system
-whose Tasks are edited in Python rather than in the UI.
+A Qt frontend and a separate robot-facing backend node for operating the RB-Y1
+MuJoCo robot through ROS 2. It supports the mobile base, manual joint/TCP moves,
+and a small Scenario system whose Tasks are edited in Python rather than in the
+UI.
+
+## Node and topic architecture
+
+The ROS mode is split into two processes:
+
+```text
+/rby1/rby1_control_ui
+  -> /rby1/control/command  (std_msgs/String)
+  -> /rby1/rby1_control_backend
+  -> RB-Y1 driver topics, services, and actions
+
+/rby1/rby1_control_backend
+  -> /rby1/control/state    (std_msgs/String)
+  -> /rby1/control/event    (std_msgs/String)
+  -> /rby1/control/response (std_msgs/String)
+  -> /rby1/rby1_control_ui
+```
+
+`control/command` is the planner-facing interface. Messages use the versioned
+JSON envelope implemented in `topic_protocol.py`:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "command",
+  "source": "dynamic_planner",
+  "request_id": "optional-unique-id",
+  "operation": "set_velocity",
+  "arguments": {"vx": 0.15, "vy": 0.0, "wz": 0.0}
+}
+```
+
+Supported operations are `set_velocity`, `stop`, `prepare_robot`,
+`request_power`, `request_servo`, `request_stream`,
+`request_control_manager`, `request_cartesian_snapshot`, `jog_joint`,
+`move_joint_group`, `jog_cartesian`, `move_cartesian`,
+`cancel_active_motion`, `cancel_motion`, `start_task_command`,
+`cancel_task_command`, and `shutdown_safely`. Robot-facing validation remains
+inside the backend node; publishing a command does not bypass its state, joint
+limit, collision, or action-conflict checks.
+
+When `request_id` is non-empty, `control/response` reports whether the backend
+accepted the transport request. Motion completion is reported asynchronously
+through `control/state` (`task_commands`) and `control/event`; a transport
+acceptance is not a claim that the robot has completed the motion. Until a
+planner-level ownership policy is added, only one controller should publish
+motion commands at a time.
+
+The normal launch file starts both nodes. They can also be run separately when
+developing a planner:
+
+```bash
+ros2 run rby1_control_ui control_backend --ros-args --params-file <config.yaml>
+ros2 run rby1_control_ui control_ui --ros-args --params-file <config.yaml>
+```
 
 The base path reuses the communication structure of
 `12_mobile_base_control.py`:
@@ -103,6 +159,27 @@ driver result. Relative Q/TCP commands additionally require fresh, verified
 source state. Emergency Stop clears base velocity and calls the driver's common
 motion-cancel service.
 
+## Object-pose interface
+
+Camera and mock-perception producers use the same typed ROS boundary:
+
+- relative topic: `perception/object_pose` (normally
+  `/rby1/perception/object_pose`);
+- message type: `rby1_msgs/msg/DetectedObjectPose`;
+- one message represents one valid object observation;
+- `header.stamp` is the image capture/detection time;
+- `header.frame_id` is the source frame of `pose`;
+- position uses metres and orientation uses a normalized ROS quaternion in
+  x/y/z/w field order;
+- `object_id` is a nonempty, stable producer-assigned identifier;
+- `confidence` is in the inclusive range 0.0 through 1.0.
+
+A producer does not publish a zero pose to mean "not detected". Consumers treat
+missing or stale observations as unavailable. The configured consumer target
+frame is `base`; conversion into that frame will be performed by the future
+frontend `CameraClient`, not by the producer. Real and mock producers must use
+this identical contract so Task execution does not depend on the source.
+
 ## Intended workspace location
 
 Place this package at exactly:
@@ -127,6 +204,11 @@ rby1_control_ui/
 └── rby1_control_ui/
     ├── __init__.py
     ├── backend_contract.py
+    ├── topic_protocol.py
+    ├── topic_backend.py
+    ├── frontend_node.py
+    ├── backend_main.py
+    ├── camera.py
     ├── qt_compat.py
     ├── ros_backend.py
     ├── mock_backend.py

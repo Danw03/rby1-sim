@@ -39,6 +39,11 @@ class TaskRunner:
         self._active_command: Optional[TaskCommand] = None
         self._command_deadline = 0.0
         self._delay_deadline: Optional[float] = None
+        self._base_deadline = None
+        self._base_velocity = None
+        self._stream_target: Optional[bool] = None
+        self._stream_deadline = 0.0
+        self._base_stop_not_before: Optional[float] = None
 
     @property
     def active(self) -> bool:
@@ -57,8 +62,8 @@ class TaskRunner:
             raise ValueError("Task has no commands")
         initial_state = self.backend.task_state()
         self._require_safe_state(initial_state, require_idle=True)
-        if initial_state.control_state != 2:
-            raise RuntimeError("robot control state must be ENABLE before Task start")
+        # if initial_state.control_state != 2:
+        #     raise RuntimeError("robot control state must be ENABLE before Task start")
         self._task = task
         self._index = 0
         self._command_id = None
@@ -88,6 +93,15 @@ class TaskRunner:
             self.stop("Task runner closed")
         self._timer.stop()
 
+    def _request_stream_transition(
+        self,
+        enabled: bool,
+        now: float,
+    ) -> None:
+        self.backend.request_stream(enabled)
+        self._stream_target = enabled
+        self._stream_deadline = now + 3.0
+
     def tick(self) -> None:
         if self._task is None:
             return
@@ -99,6 +113,38 @@ class TaskRunner:
             )
             now = self.clock()
 
+            if self._stream_target is not None:
+                if state.stream_enabled is self._stream_target:
+                    self._stream_target = None
+                elif now > self._stream_deadline:
+                    raise RuntimeError(
+                        "Stream state transition timed out"
+                    )
+                else:
+                    return
+                
+            if self._base_deadline is not None:
+                if now >= self._base_deadline:
+                    self.backend.stop(publish_immediately=True)
+
+                    self._base_deadline = None
+                    self._base_velocity = None
+                    self._index += 1
+
+                    self._request_stream_transition(False, now)
+
+                    self.on_status(
+                        f"Task step {self._index}/{len(self._task.commands)} completed"
+                    )
+                    return
+                else:
+                    if self._base_velocity is None:
+                        raise RuntimeError("active base velocity is missing")
+
+                    # 0.35초 stale timeout에 걸리지 않도록 매 tick 갱신
+                    self.backend.set_velocity(*self._base_velocity)
+                    return
+            
             if self._delay_deadline is not None:
                 if now >= self._delay_deadline:
                     self._delay_deadline = None
@@ -131,6 +177,23 @@ class TaskRunner:
                 return
 
             command = self._task.commands[self._index]
+
+            if command.kind is CommandKind.BASE_VELOCITY:
+                if state.stream_enabled is not True:
+                    self._request_stream_transition(True, now,)
+                    return
+                
+                self._base_velocity = command.values
+                self._base_deadline = now + float(command.seconds or 0.0)
+
+                self.backend.set_velocity(*command.values)
+
+                self.on_status(
+                    f"Task step {self._index + 1}/{len(self._task.commands)}: "
+                    f"base_velocity {float(command.seconds or 0.0):.3f}s"
+                )
+                return
+            
             if command.kind is CommandKind.DELAY:
                 self._delay_deadline = now + float(command.seconds or 0.0)
                 self.on_status(
@@ -156,11 +219,18 @@ class TaskRunner:
     def _finish(self) -> None:
         was_active = self.active
         self._timer.stop()
+
+        if self._base_deadline is not None:
+            self.backend.stop(publish_immediately=True)
+
         self._task = None
         self._index = 0
         self._command_id = None
         self._active_command = None
         self._delay_deadline = None
+
+        self._base_deadline = None
+        self._base_velocity = None
         if was_active:
             self.on_active_changed(False)
 
@@ -396,14 +466,6 @@ class TaskRunner:
             raise RuntimeError("collision state is active or unknown")
         if state.control_state not in (2, 3):
             raise RuntimeError("robot control state is not ENABLE/EXECUTING")
-        if state.driver_safety_verified is not True:
-            raise RuntimeError("driver Scenario safety contract is not verified")
-        self._require_fresh(
-            state.driver_safety_updated_at,
-            state.captured_at,
-            "driver Scenario safety proof",
-            maximum_age=2.5,
-        )
         if require_idle and state.motion_active:
             raise RuntimeError("another manipulation motion is active")
 

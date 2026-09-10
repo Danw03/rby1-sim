@@ -1,3 +1,5 @@
+"""Launch the mock object-pose producer for perception integration tests."""
+
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
@@ -8,34 +10,24 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    package_share = Path(get_package_share_directory('rby1_control_ui'))
-    default_config = str(package_share / 'config' / 'default.yaml')
+    package_share = Path(get_package_share_directory('rby1_camera'))
+    default_config = str(package_share / 'config' / 'mock_object_pose.yaml')
 
     namespace_arg = DeclareLaunchArgument(
         'namespace',
         default_value='rby1',
-        description='ROS namespace for frontend, backend, and robot interfaces.',
+        description='Namespace for the mock perception producer.',
     )
     config_arg = DeclareLaunchArgument(
         'config',
         default_value=default_config,
-        description='Path to the UI ROS parameter YAML file.',
+        description='Mock object-pose parameter file.',
     )
 
-    backend_node = Node(
-        package='rby1_control_ui',
-        executable='control_backend',
-        name='rby1_control_backend',
-        namespace=LaunchConfiguration('namespace'),
-        parameters=[LaunchConfiguration('config')],
-        output='screen',
-        emulate_tty=True,
-    )
-
-    ui_node = Node(
-        package='rby1_control_ui',
-        executable='control_ui',
-        name='rby1_control_ui',
+    mock_publisher = Node(
+        package='rby1_camera',
+        executable='mock_object_pose_publisher',
+        name='mock_object_pose_publisher',
         namespace=LaunchConfiguration('namespace'),
         parameters=[LaunchConfiguration('config')],
         output='screen',
@@ -45,6 +37,5 @@ def generate_launch_description():
     return LaunchDescription([
         namespace_arg,
         config_arg,
-        backend_node,
-        ui_node,
+        mock_publisher,
     ])

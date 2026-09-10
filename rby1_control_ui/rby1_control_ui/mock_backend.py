@@ -483,6 +483,7 @@ class MockRby1Backend:
                 captured_at=now,
                 robot_state_updated_at=now,
                 control_state=self.control_state,
+                stream_enabled=self.stream_enabled,
                 emo_active=self.emo_active,
                 collision_active=self.collision_active,
                 motion_active=bool(self._motion_active),

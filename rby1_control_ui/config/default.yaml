@@ -3,6 +3,22 @@
     # Relative names are resolved inside the node namespace, normally /rby1.
     cmd_vel_topic: cmd_vel
     robot_state_topic: robot_state
+
+    # Versioned std_msgs/String bridge between the frontend and backend nodes.
+    control_command_topic: control/command
+    control_state_topic: control/state
+    control_event_topic: control/event
+    control_response_topic: control/response
+    control_state_publish_rate_hz: 20.0
+    control_state_timeout_sec: 1.0
+
+    # Perception producers publish one valid, timestamped observation per
+    # rby1_msgs/DetectedObjectPose message. The frontend will transform the
+    # source-frame pose into object_pose_target_frame at Task runtime.
+    object_pose_topic: perception/object_pose
+    object_pose_target_frame: base
+    object_pose_max_age_sec: 0.5
+
     power_state_topic: power_state
     servo_state_topic: servo_state
     power_servo_feedback_timeout_sec: 1.5

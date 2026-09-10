@@ -44,14 +44,13 @@ def _run_mock(argv):
 
 def _run_ros(argv):
     import rclpy
-    from .ros_backend import Rby1ControlNode
+    from .frontend_node import ControlUiFrontendNode
 
     rclpy.init(args=argv[1:])
     app = QApplication(argv)
     app.setApplicationName('RB-Y1 M v1.3 Control UI')
 
-    node = Rby1ControlNode()
-    node.backend_name = 'ROS2'
+    node = ControlUiFrontendNode()
     window = MainWindow(node)
     app.installEventFilter(window)
 

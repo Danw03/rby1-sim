@@ -64,6 +64,7 @@ class TaskBackendState:
     captured_at: float
     robot_state_updated_at: Optional[float]
     control_state: Optional[int]
+    stream_enabled: Optional[bool]
     emo_active: Optional[bool]
     collision_active: Optional[bool]
     motion_active: bool
